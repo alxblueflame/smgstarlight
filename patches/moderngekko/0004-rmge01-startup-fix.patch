@@ -1,0 +1,55 @@
+diff --git a/tools/moderngekko_port.cpp b/tools/moderngekko_port.cpp
+--- a/tools/moderngekko_port.cpp
++++ b/tools/moderngekko_port.cpp
+@@ -20,7 +20,7 @@ namespace
+ constexpr std::string_view RECOMPCORE_REVISION = "1873066167f3d03b39771b547f280d2b970427b6";
+ constexpr std::string_view DOLRECOMP_REVISION =
+     "3606fbd226951631fd258e81fb26854ae9bbd21f";
+-constexpr std::string_view MODULE_PATCHSET_REVISION = "smgrecomp-20260720.1";
++constexpr std::string_view MODULE_PATCHSET_REVISION = "smgrecomp-20260721.1";
+ 
+ struct BuildOptions
+ {
+@@ -88,22 +88,35 @@ bool ApplyGameSourcePatches(const moderngekko::GameMetadata& game, const fs::pa
+   }
+ 
+   std::string source((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
++  constexpr std::string_view label = "label_80340408:";
+   constexpr std::string_view original =
+       "ctx->gpr[4] = ctx->gpr[13] + (u32)(s32)(-12432);";
+   constexpr std::string_view patched =
+       "ctx->gpr[4] = ctx->gpr[13] + (u32)(s32)(-12416);";
+-  if (source.find(patched) != std::string::npos)
+-    return true;
+-
+-  const std::size_t position = source.find(original);
+-  if (position == std::string::npos)
++  const std::size_t label_position = source.find(label);
++  if (label_position == std::string::npos)
+   {
+-    std::cerr << "RMGE01 LogoScene::init does not match the pinned USA revision\n";
++    std::cerr << "RMGE01 LogoScene::init label does not match the pinned USA revision\n";
+     return false;
+   }
+ 
+-  source.replace(position, original.size(), patched);
++  const std::size_t next_label = source.find("\nlabel_", label_position + label.size());
++  const std::size_t original_position = source.find(original, label_position);
++  const std::size_t patched_position = source.find(patched, label_position);
++  if (patched_position != std::string::npos &&
++      (next_label == std::string::npos || patched_position < next_label))
++  {
++    return true;
++  }
++  if (original_position == std::string::npos ||
++      (next_label != std::string::npos && original_position >= next_label))
++  {
++    std::cerr << "RMGE01 LogoScene::init instruction does not match the pinned USA revision\n";
++    return false;
++  }
++
++  source.replace(original_position, original.size(), patched);
+   std::ofstream output(chunk, std::ios::binary | std::ios::trunc);
+   output.write(source.data(), static_cast<std::streamsize>(source.size()));
+   return static_cast<bool>(output);
+ }

@@ -1,0 +1,60 @@
+diff --git a/Source/Core/Common/StringUtil.h b/Source/Core/Common/StringUtil.h
+index 0cc4e6c..4c132b0 100644
+--- a/Source/Core/Common/StringUtil.h
++++ b/Source/Core/Common/StringUtil.h
+@@ -256,12 +256,12 @@ inline std::wstring UTF8ToTStr(std::string_view str)
+ #else
+ inline std::string TStrToUTF8(std::string_view str)
+ {
+-  return str;
++  return std::string(str);
+ }
+ 
+ inline std::string UTF8ToTStr(std::string_view str)
+ {
+-  return str;
++  return std::string(str);
+ }
+ #endif
+ 
+diff --git a/GXRuntime/src/core/cpu.c b/GXRuntime/src/core/cpu.c
+index 0bf0bc0..56f0133 100644
+--- a/GXRuntime/src/core/cpu.c
++++ b/GXRuntime/src/core/cpu.c
+@@ -24,7 +24,12 @@
+  * offset (into cpu->ram) about to be written, `size` the width in bytes. */
+ PPCMemWriteJournal g_mem_write_journal = NULL;
+ void* g_mem_write_journal_user = NULL;
+-__attribute__((visibility("default"))) void ppc_set_mem_write_journal(PPCMemWriteJournal fn, void* user) {
++#if defined(_MSC_VER)
++#define GXRUNTIME_EXPORT __declspec(dllexport)
++#else
++#define GXRUNTIME_EXPORT __attribute__((visibility("default")))
++#endif
++GXRUNTIME_EXPORT void ppc_set_mem_write_journal(PPCMemWriteJournal fn, void* user) {
+     g_mem_write_journal = fn;
+     g_mem_write_journal_user = user;
+ }
+diff --git a/Source/Core/DolphinNoGUI/PlatformWin32.cpp b/Source/Core/DolphinNoGUI/PlatformWin32.cpp
+index 09527be..f4849df 100644
+--- a/Source/Core/DolphinNoGUI/PlatformWin32.cpp
++++ b/Source/Core/DolphinNoGUI/PlatformWin32.cpp
+@@ -3,14 +3,18 @@
+ 
+ #include "DolphinNoGUI/Platform.h"
+ 
++#include "Common/StringUtil.h"
+ #include "Core/Config/MainSettings.h"
+ #include "Core/Config/ConfigManager.h"
+ #include "Core/Core.h"
+ #include "Core/System.h"
+ 
+ #include <Windows.h>
++#include <chrono>
+ #include <climits>
+ #include <dwmapi.h>
++#include <tchar.h>
++#include <thread>
+ 
+ #include "VideoCommon/Present.h"
+ #include "resource.h"

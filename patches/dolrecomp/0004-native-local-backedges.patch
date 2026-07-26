@@ -1,0 +1,13 @@
+diff --git a/src/backend/emitter.c b/src/backend/emitter.c
+--- a/src/backend/emitter.c
++++ b/src/backend/emitter.c
+@@ -347,7 +347,8 @@ static void emit_direct_branch(FILE* out, const PPCInst* inst,
+     }
+     if (local_target && inst->branch_target <= inst->address) {
+         fprintf(out, "            ctx->pc = 0x%08Xu;\n", inst->branch_target);
+-        fprintf(out, "            return;\n");
++        emit_local_budget_guard(out);
++        fprintf(out, "            goto label_%08X;\n", inst->branch_target);
+     } else if (local_target) {
+         fprintf(out, "            goto label_%08X;\n", inst->branch_target);
+     } else {

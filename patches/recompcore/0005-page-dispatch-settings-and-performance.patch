@@ -1,0 +1,587 @@
+diff --git a/GXRuntime/include/core/cpu.h b/GXRuntime/include/core/cpu.h
+index ccbca5a3117019b3b0bbc48aa80fc69c4b8f63bd..4b394db89ea384ed333f2abeef72e9f1dc759d86 100644
+--- a/GXRuntime/include/core/cpu.h
++++ b/GXRuntime/include/core/cpu.h
+@@ -30,7 +30,8 @@
+ //   consumes and resets it (Dolphin chassis: per-dispatch flush into
+ //   ppc_state.downcount). Hosts that do not meter guest time may ignore it
+ //   (s64: it cannot wrap in any realistic session).
+-#define GXRUNTIME_CPU_ABI_VERSION 2u
++// - ABI v3 adds `dispatch_budget` for timing-bounded native call and loop linking.
++#define GXRUNTIME_CPU_ABI_VERSION 3u
+ #define GXRUNTIME_CPU_ABI_DOLRECOMP_PREFIX 1u
+ #define GXRUNTIME_CPU_ABI_EXTERNAL_POINTER_EXTENSION 1u
+ 
+@@ -145,6 +146,7 @@ struct CPUState {
+     s64 downcount;
+     u8* exram;
+     u32 exram_size;
++    s64 dispatch_budget;
+ };
+ 
+ #include <stdio.h>
+diff --git a/GXRuntime/tests/runtime_tests.c b/GXRuntime/tests/runtime_tests.c
+index 55606fb0431f12d557e985ff50f7080d31713652..68452269fd5a58e78b9c1cd52180e0a613ca8a99 100644
+--- a/GXRuntime/tests/runtime_tests.c
++++ b/GXRuntime/tests/runtime_tests.c
+@@ -27,7 +27,7 @@
+ #include <stdio.h>
+ #include <string.h>
+ 
+-_Static_assert(GXRUNTIME_CPU_ABI_VERSION == 2u,
++_Static_assert(GXRUNTIME_CPU_ABI_VERSION == 3u,
+                "update runtime ABI tests when the CPU ABI changes");
+ _Static_assert(GXRUNTIME_CPU_ABI_DOLRECOMP_PREFIX == 1u,
+                "GXRuntime generated-code prefix must stay explicit");
+diff --git a/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore.cpp b/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore.cpp
+index 11e7d7b0d043f8bba7507e1977cc70c9fda2055e..80ebbba023c4d40e9f119572f6e6151f206984cc 100644
+--- a/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore.cpp
++++ b/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore.cpp
+@@ -159,19 +159,21 @@ void StaticRecompCore::Shutdown()
+   g_static_recomp_core = nullptr;
+   std::fprintf(stderr,
+                "[staticrecomp] shutdown: native=%llu fallback=%llu native_exc=%llu hook_fb=%llu "
+-               "smc_failed=%u verifications=%llu reverify_events=%llu jit_slices=%llu\n",
++               "smc_failed=%u verifications=%llu reverify_events=%llu charged_cycles=%llu "
++               "jit_slices=%llu\n",
+                (unsigned long long)m_native_dispatches, (unsigned long long)m_fallback_steps,
+                (unsigned long long)m_native_exceptions,
+                (unsigned long long)m_hook_fallback_instructions, m_failed_chunks,
+                (unsigned long long)m_verifications, (unsigned long long)m_reverify_events,
++               (unsigned long long)m_charged_cycles,
+                (unsigned long long)m_fallback_jit_slices);
+   NOTICE_LOG_FMT(POWERPC,
+                  "StaticRecomp: shutdown. native_dispatches={} fallback_steps={} "
+                  "native_exceptions={} hook_fallback_instructions={} smc_failed_chunks={} "
+-                 "verifications={} reverify_events={}",
++                 "verifications={} reverify_events={} charged_cycles={}",
+                  m_native_dispatches, m_fallback_steps, m_native_exceptions,
+                  m_hook_fallback_instructions, m_failed_chunks, m_verifications,
+-                 m_reverify_events);
++                 m_reverify_events, m_charged_cycles);
+   m_lockstep_verifier.reset();
+   m_block_cache.Shutdown();
+   m_module = nullptr;
+diff --git a/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_Hooks.cpp b/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_Hooks.cpp
+index 7b6f8602af29213082a39e271a55fcd84e508a44..c1f5a7a6f3e494cc4e608c5c6f0fd29bb325926b 100644
+--- a/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_Hooks.cpp
++++ b/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_Hooks.cpp
+@@ -192,6 +192,9 @@ void StaticRecompCore::HookInstructionFallback(CPUState* cpu, u32 raw, u32 cia)
+       if (xo == 982u)
+       {
+         system.GetJitInterface().InvalidateICacheLine(ea);
++        // Do not enter another generated block until the chassis has
++        // revalidated the invalidated code chunk.
++        cpu->dispatch_budget = 0;
+       }
+       // These bypass SingleStepInner, so charge Dolphin's PPCTables cost
+       // here (icbi 4, dcbf/dcbst/dcbi 5); their emitted block cost is zero.
+diff --git a/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_Run.cpp b/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_Run.cpp
+index de0a7728f42f9b4035206a799413cafbc4fb0901..c1e8ac55ffa516889558cbfd0106774482c28e70 100644
+--- a/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_Run.cpp
++++ b/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_Run.cpp
+@@ -99,6 +99,7 @@ void StaticRecompCore::Run()
+           }
+ 
+           const u32 dispatch_pc = m_guest.pc;
++          m_guest.dispatch_budget = std::max<s64>(ppc.downcount, 1);
+           if (trace_enabled)
+             GPFifo::SetBurstTraceDispatchEntry(dispatch_pc);
+           m_module->dispatch(&m_guest, dispatch_pc);
+diff --git a/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_Sync.cpp b/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_Sync.cpp
+index c2482a74580ec3d0a65b8ee41936b2ca562d4b94..0969fd5198f9d592f5c270ae6c35f707a3bbbbe1 100644
+--- a/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_Sync.cpp
++++ b/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_Sync.cpp
+@@ -5,6 +5,7 @@
+ #include "Core/System.h"
+ #include "Core/PowerPC/PowerPC.h"
+ #include "Core/HW/SystemTimers.h"
++#include <algorithm>
+ #include <cstring>
+ 
+ void StaticRecompCore::SetPPCStateFromGuestState(const CPUState& s, PowerPC::PowerPCState& ppc)
+@@ -72,6 +73,7 @@ void StaticRecompCore::SyncIn()
+   m_guest.exception = 0;
+   m_guest.program_exception = 0;
+   m_guest.downcount = 0;  // charge accumulator, not a copy of ppc.downcount
++  m_guest.dispatch_budget = std::max<s64>(ppc.downcount, 1);
+ 
+   if (m_module && m_module->on_state_loaded)
+     m_module->on_state_loaded(&m_guest);
+diff --git a/Source/Core/VideoCommon/OnScreenUI.cpp b/Source/Core/VideoCommon/OnScreenUI.cpp
+index 58c7a02371a1ecadd398e726896836b461b54036..511c9a0d9639b62cb8f00f5959f1e769211f2d81 100644
+--- a/Source/Core/VideoCommon/OnScreenUI.cpp
++++ b/Source/Core/VideoCommon/OnScreenUI.cpp
+@@ -3,20 +3,21 @@
+ 
+ #include "VideoCommon/OnScreenUI.h"
+ 
++#include <cstdlib>
++
+ #include "Common/CommonPaths.h"
+ #include "Common/EnumMap.h"
+ #include "Common/FileUtil.h"
++#include "Common/NandPaths.h"
+ #include "Common/Profiler.h"
+ #include "Common/Timer.h"
+ 
+ #include "Core/Achievements/AchievementManager.h"
+ #include "Core/Config/AchievementSettings.h"
+-#include "Common/NandPaths.h"
+ #include "Core/Config/ConfigManager.h"
+ #include "Core/Config/GraphicsSettings.h"
+ #include "Core/Config/MainSettings.h"
+ #include "Core/Config/NetplaySettings.h"
+-#include <cstdlib>
+ #include "Core/Movie.h"
+ #include "Core/System.h"
+ 
+@@ -86,6 +87,13 @@ bool OnScreenUI::Initialize(u32 width, u32 height, float scale)
+   std::string file = File::GetUserPath(D_LOAD_IDX) + "OSD_Font.ttf";
+ 
+   bool font_exists = File::Exists(file);
++#ifdef _WIN32
++  if (!font_exists)
++  {
++    file = "C:/Windows/Fonts/segoeui.ttf";
++    font_exists = File::Exists(file);
++  }
++#endif
+   if (!font_exists)
+   {
+     // Default supplied font
+@@ -421,81 +429,315 @@ void OnScreenUI::DrawSettingsPanel()
+   if (!m_show_settings.load(std::memory_order_relaxed))
+     return;
+ 
+-  ImGui::SetNextWindowPos(ImVec2(24.0f * m_backbuffer_scale, 24.0f * m_backbuffer_scale),
+-                          ImGuiCond_FirstUseEver);
+-  ImGui::SetNextWindowBgAlpha(0.94f);
++  const ImGuiViewport* viewport = ImGui::GetMainViewport();
++  ImGui::SetNextWindowPos(viewport->GetCenter(), ImGuiCond_FirstUseEver, ImVec2(0.5f, 0.5f));
++  ImGui::SetNextWindowSize(ImVec2(760.0f, 540.0f), ImGuiCond_FirstUseEver);
++  ImGui::SetNextWindowSizeConstraints(ImVec2(620.0f, 440.0f), viewport->WorkSize);
++
++  ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 12.0f);
++  ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 6.0f);
++  ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(22.0f, 18.0f));
++  ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(10.0f, 10.0f));
++  ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.035f, 0.047f, 0.075f, 0.98f));
++  ImGui::PushStyleColor(ImGuiCol_Header, ImVec4(0.12f, 0.31f, 0.58f, 0.80f));
++  ImGui::PushStyleColor(ImGuiCol_HeaderHovered, ImVec4(0.16f, 0.42f, 0.76f, 0.90f));
++  ImGui::PushStyleColor(ImGuiCol_HeaderActive, ImVec4(0.19f, 0.49f, 0.88f, 1.00f));
++  ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.11f, 0.28f, 0.52f, 0.90f));
++  ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.16f, 0.42f, 0.76f, 1.00f));
++  ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.12f, 0.34f, 0.65f, 1.00f));
++  ImGui::PushStyleColor(ImGuiCol_CheckMark, ImVec4(0.34f, 0.73f, 1.00f, 1.00f));
++  ImGui::PushStyleColor(ImGuiCol_SliderGrab, ImVec4(0.34f, 0.73f, 1.00f, 1.00f));
++
+   bool open = true;
+-  if (ImGui::Begin("Settings  (F2 to close)", &open, ImGuiWindowFlags_AlwaysAutoResize))
+-  {
+-    // Internal resolution: Dolphin applies GFX_EFB_SCALE changes live.
+-    static const char* const resolutions[] = {"Auto (window size)", "1x (640x528)",
+-                                              "2x (1280x1056)",     "3x (1920x1584)",
+-                                              "4x (2560x2112)",     "5x (3200x2640)",
+-                                              "6x (3840x3168)"};
+-    int scale = Config::Get(Config::GFX_EFB_SCALE);
+-    if (scale < 0 || scale > 6)
+-      scale = 0;
+-    if (ImGui::Combo("Internal resolution", &scale, resolutions, IM_ARRAYSIZE(resolutions)))
+-      Config::SetBaseOrCurrent(Config::GFX_EFB_SCALE, scale);
+-
+-    float speed = Config::Get(Config::MAIN_EMULATION_SPEED);
+-    bool unlimited = speed <= 0.0f;
+-    if (ImGui::Checkbox("Unlimited speed", &unlimited))
+-      Config::SetBaseOrCurrent(Config::MAIN_EMULATION_SPEED, unlimited ? 0.0f : 1.0f);
+-    if (!unlimited)
++  if (ImGui::Begin("Super Mario Galaxy - PC Settings", &open))
++  {
++    ImGui::TextColored(ImVec4(0.34f, 0.73f, 1.00f, 1.00f), "PC RECOMPILATION");
++    ImGui::SameLine();
++    ImGui::TextDisabled("  RMGE01  |  F2 closes this menu");
++    ImGui::Separator();
++
++    if (ImGui::BeginTabBar("GalaxySettings", ImGuiTabBarFlags_FittingPolicyScroll))
+     {
+-      if (ImGui::SliderFloat("Speed limit", &speed, 0.25f, 2.0f, "%.2fx"))
+-        Config::SetBaseOrCurrent(Config::MAIN_EMULATION_SPEED, speed);
++      if (ImGui::BeginTabItem("Display"))
++      {
++        DrawDisplaySettings();
++        ImGui::EndTabItem();
++      }
++      if (ImGui::BeginTabItem("Graphics"))
++      {
++        DrawGraphicsSettings();
++        ImGui::EndTabItem();
++      }
++      if (ImGui::BeginTabItem("Performance"))
++      {
++        DrawPerformanceSettings();
++        ImGui::EndTabItem();
++      }
++      if (ImGui::BeginTabItem("Controller"))
++      {
++        DrawControllerSettings();
++        ImGui::EndTabItem();
++      }
++      if (ImGui::BeginTabItem("Save Data"))
++      {
++        DrawSaveSettings();
++        ImGui::EndTabItem();
++      }
++      ImGui::EndTabBar();
+     }
+ 
+-    bool vsync = Config::Get(Config::GFX_VSYNC);
+-    if (ImGui::Checkbox("VSync", &vsync))
+-      Config::SetBaseOrCurrent(Config::GFX_VSYNC, vsync);
++    ImGui::SetCursorPosY(ImGui::GetWindowHeight() - 34.0f);
++    ImGui::Separator();
++    ImGui::TextDisabled("Changes are saved to this game's private user profile.");
++  }
++  ImGui::End();
++  ImGui::PopStyleColor(9);
++  ImGui::PopStyleVar(4);
++  if (!open)
++    m_show_settings = false;
++}
+ 
+-    bool show_fps = Config::Get(Config::GFX_SHOW_FPS);
+-    if (ImGui::Checkbox("FPS / speed overlay", &show_fps))
+-    {
+-      Config::SetBaseOrCurrent(Config::GFX_SHOW_FPS, show_fps);
+-      Config::SetBaseOrCurrent(Config::GFX_SHOW_SPEED, show_fps);
+-    }
++void OnScreenUI::DrawDisplaySettings()
++{
++  ImGui::TextUnformatted("Output");
++  ImGui::TextDisabled("Resolution and presentation changes apply while the game is running.");
++  ImGui::Spacing();
++
++  static const char* const resolutions[] = {"Auto (window size)", "Native (640 x 528)",
++                                            "2x (1280 x 1056)",   "3x (1920 x 1584)",
++                                            "4x (2560 x 2112)",   "5x (3200 x 2640)",
++                                            "6x (3840 x 3168)"};
++  int scale = Config::Get(Config::GFX_EFB_SCALE);
++  if (scale < 0 || scale >= IM_ARRAYSIZE(resolutions))
++    scale = 0;
++  ImGui::SetNextItemWidth(310.0f);
++  if (ImGui::Combo("Internal resolution", &scale, resolutions, IM_ARRAYSIZE(resolutions)))
++    Config::SetBaseOrCurrent(Config::GFX_EFB_SCALE, scale);
++  if (ImGui::IsItemHovered())
++    ImGui::SetTooltip("The largest GPU performance setting. 2x is recommended for Vega 11.");
++
++  static const char* const aspects[] = {"Auto", "16:9", "4:3", "Stretch", "Custom",
++                                        "Custom stretch", "Square pixels"};
++  int aspect = static_cast<int>(Config::Get(Config::GFX_ASPECT_RATIO));
++  if (aspect < 0 || aspect >= IM_ARRAYSIZE(aspects))
++    aspect = 0;
++  ImGui::SetNextItemWidth(310.0f);
++  if (ImGui::Combo("Aspect ratio", &aspect, aspects, IM_ARRAYSIZE(aspects)))
++    Config::SetBaseOrCurrent(Config::GFX_ASPECT_RATIO, static_cast<AspectMode>(aspect));
++
++  bool vsync = Config::Get(Config::GFX_VSYNC);
++  if (ImGui::Checkbox("Vertical sync", &vsync))
++    Config::SetBaseOrCurrent(Config::GFX_VSYNC, vsync);
++
++  bool show_metrics = Config::Get(Config::GFX_SHOW_FPS);
++  if (ImGui::Checkbox("Performance overlay", &show_metrics))
++  {
++    Config::SetBaseOrCurrent(Config::GFX_SHOW_FPS, show_metrics);
++    Config::SetBaseOrCurrent(Config::GFX_SHOW_SPEED, show_metrics);
++  }
++}
+ 
+-    bool hires = Config::Get(Config::GFX_HIRES_TEXTURES);
+-    if (ImGui::Checkbox("Custom HD textures", &hires))
+-      Config::SetBaseOrCurrent(Config::GFX_HIRES_TEXTURES, hires);
++void OnScreenUI::DrawGraphicsSettings()
++{
++  ImGui::TextUnformatted("Image quality");
++  ImGui::TextDisabled("Features here preserve the original rendering unless explicitly enabled.");
++  ImGui::Spacing();
++
++  bool widescreen = Config::Get(Config::GFX_WIDESCREEN_HACK);
++  if (ImGui::Checkbox("Experimental widescreen expansion", &widescreen))
++    Config::SetBaseOrCurrent(Config::GFX_WIDESCREEN_HACK, widescreen);
++  if (ImGui::IsItemHovered())
++    ImGui::SetTooltip("Expands 3D geometry beyond the original view; some scenes may show artifacts.");
++
++  bool hires = Config::Get(Config::GFX_HIRES_TEXTURES);
++  if (ImGui::Checkbox("Load custom HD textures", &hires))
++    Config::SetBaseOrCurrent(Config::GFX_HIRES_TEXTURES, hires);
++
++  bool cache_hires = Config::Get(Config::GFX_CACHE_HIRES_TEXTURES);
++  ImGui::BeginDisabled(!hires);
++  if (ImGui::Checkbox("Preload HD textures into memory", &cache_hires))
++    Config::SetBaseOrCurrent(Config::GFX_CACHE_HIRES_TEXTURES, cache_hires);
++  ImGui::EndDisabled();
++  if (ImGui::IsItemHovered())
++    ImGui::SetTooltip("Reduces texture pop-in but can use a large amount of RAM.");
++
++  static const char* const filtering[] = {"Game controlled", "Nearest", "Linear"};
++  int texture_filtering =
++      static_cast<int>(Config::Get(Config::GFX_ENHANCE_FORCE_TEXTURE_FILTERING));
++  if (texture_filtering < 0 || texture_filtering >= IM_ARRAYSIZE(filtering))
++    texture_filtering = 0;
++  ImGui::SetNextItemWidth(310.0f);
++  if (ImGui::Combo("Texture filtering", &texture_filtering, filtering,
++                   IM_ARRAYSIZE(filtering)))
++  {
++    Config::SetBaseOrCurrent(Config::GFX_ENHANCE_FORCE_TEXTURE_FILTERING,
++                             static_cast<TextureFilteringMode>(texture_filtering));
++  }
++
++  static const char* const anisotropy[] = {"Game controlled", "1x", "2x", "4x", "8x", "16x"};
++  int anisotropy_index =
++      static_cast<int>(Config::Get(Config::GFX_ENHANCE_MAX_ANISOTROPY)) + 1;
++  if (anisotropy_index < 0 || anisotropy_index >= IM_ARRAYSIZE(anisotropy))
++    anisotropy_index = 0;
++  ImGui::SetNextItemWidth(310.0f);
++  if (ImGui::Combo("Anisotropic filtering", &anisotropy_index, anisotropy,
++                   IM_ARRAYSIZE(anisotropy)))
++  {
++    Config::SetBaseOrCurrent(Config::GFX_ENHANCE_MAX_ANISOTROPY,
++                             static_cast<AnisotropicFilteringMode>(anisotropy_index - 1));
++  }
+ 
+-    ImGui::Separator();
+-    const u64 title_id = SConfig::GetInstance().GetTitleID();
+-    if (ImGui::Button("Back up save now"))
+-    {
+-      const std::string save_path = Common::GetTitleDataPath(title_id) + "/";
+-      const std::string backup_root = File::GetUserPath(D_BACKUP_IDX);
+-      const std::string stamp = std::to_string(Common::Timer::NowMs());
+-      const std::string destination = backup_root + "save-" + stamp + "/";
+-      File::CreateFullPath(destination);
+-      if (File::Copy(save_path, destination, true))
+-        m_settings_status = "Save backed up to " + destination;
+-      else
+-        m_settings_status = "Backup failed (no save data yet?)";
+-    }
+ #ifdef _WIN32
++  if (ImGui::Button("Open HD texture folder"))
++  {
++    std::string texture_path = File::GetUserPath(D_LOAD_IDX) + "Textures/RMGE01/";
++    File::CreateFullPath(texture_path);
++    for (char& c : texture_path)
++      if (c == '/')
++        c = '\\';
++    std::system(("explorer \"" + texture_path + "\"").c_str());
++  }
++#endif
++}
++
++void OnScreenUI::DrawPerformanceSettings()
++{
++  ImGui::TextUnformatted("Performance profile");
++  ImGui::TextDisabled("These presets change GPU cost, not the speed of the game simulation.");
++  ImGui::Spacing();
++
++  if (ImGui::Button("Performance", ImVec2(150.0f, 34.0f)))
++  {
++    Config::SetBaseOrCurrent(Config::GFX_EFB_SCALE, 1);
++    Config::SetBaseOrCurrent(Config::GFX_SHADER_COMPILATION_MODE,
++                             ShaderCompilationMode::AsynchronousUberShaders);
++    Config::SetBaseOrCurrent(Config::GFX_BACKEND_MULTITHREADING, true);
++  }
++  ImGui::SameLine();
++  if (ImGui::Button("Balanced", ImVec2(150.0f, 34.0f)))
++  {
++    Config::SetBaseOrCurrent(Config::GFX_EFB_SCALE, 2);
++    Config::SetBaseOrCurrent(Config::GFX_SHADER_COMPILATION_MODE,
++                             ShaderCompilationMode::AsynchronousUberShaders);
++    Config::SetBaseOrCurrent(Config::GFX_BACKEND_MULTITHREADING, true);
++  }
++  ImGui::SameLine();
++  if (ImGui::Button("High quality", ImVec2(150.0f, 34.0f)))
++  {
++    Config::SetBaseOrCurrent(Config::GFX_EFB_SCALE, 3);
++    Config::SetBaseOrCurrent(Config::GFX_SHADER_COMPILATION_MODE,
++                             ShaderCompilationMode::AsynchronousUberShaders);
++    Config::SetBaseOrCurrent(Config::GFX_BACKEND_MULTITHREADING, true);
++  }
++
++  static const char* const shader_modes[] = {"Specialized (may stutter)",
++                                             "Exclusive ubershaders",
++                                             "Hybrid ubershaders (recommended)",
++                                             "Skip rendering while compiling"};
++  int shader_mode = static_cast<int>(Config::Get(Config::GFX_SHADER_COMPILATION_MODE));
++  if (shader_mode < 0 || shader_mode >= IM_ARRAYSIZE(shader_modes))
++    shader_mode = 2;
++  ImGui::SetNextItemWidth(310.0f);
++  if (ImGui::Combo("Shader compilation", &shader_mode, shader_modes,
++                   IM_ARRAYSIZE(shader_modes)))
++  {
++    Config::SetBaseOrCurrent(Config::GFX_SHADER_COMPILATION_MODE,
++                             static_cast<ShaderCompilationMode>(shader_mode));
++  }
++
++  bool backend_mt = Config::Get(Config::GFX_BACKEND_MULTITHREADING);
++  if (ImGui::Checkbox("Multithreaded graphics backend", &backend_mt))
++    Config::SetBaseOrCurrent(Config::GFX_BACKEND_MULTITHREADING, backend_mt);
++
++  const float simulation_speed = Config::Get(Config::MAIN_EMULATION_SPEED);
++  ImGui::Separator();
++  ImGui::TextUnformatted("Game simulation");
++  if (simulation_speed == 1.0f)
++    ImGui::TextColored(ImVec4(0.40f, 0.86f, 0.56f, 1.00f), "100%% - original timing");
++  else
++  {
++    ImGui::TextColored(ImVec4(1.00f, 0.65f, 0.25f, 1.00f),
++                       "Non-standard speed: %.2fx", simulation_speed);
+     ImGui::SameLine();
+-    if (ImGui::Button("Open save folder"))
++    if (ImGui::SmallButton("Restore 100%"))
++      Config::SetBaseOrCurrent(Config::MAIN_EMULATION_SPEED, 1.0f);
++  }
++  ImGui::TextWrapped("The recompiled PPC game remains a 60 Hz simulation. High-refresh output "
++                     "requires presentation interpolation; removing the speed limit would make "
++                     "gameplay and audio run faster.");
++}
++
++void OnScreenUI::DrawControllerSettings()
++{
++  ImGui::TextUnformatted("Galaxy controller profile");
++  ImGui::TextDisabled("Wii Remote + Nunchuk behavior is translated to a standard gamepad.");
++  ImGui::Spacing();
++
++  if (ImGui::BeginTable("ControllerMap", 2,
++                        ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerH |
++                            ImGuiTableFlags_SizingStretchProp))
++  {
++    const char* const bindings[][2] = {{"Move", "Left stick"},
++                                       {"Star pointer", "Right stick or controller motion"},
++                                       {"Jump / confirm", "A / Cross"},
++                                       {"Crouch / back", "B / Circle or right trigger"},
++                                       {"Spin / shake", "X / Square"},
++                                       {"Camera reset (C)", "Left shoulder"},
++                                       {"Crouch (Z)", "Left trigger"},
++                                       {"Pause", "Menu / Options"}};
++    for (const auto& binding : bindings)
+     {
+-      const std::string save_path = Common::GetTitleDataPath(title_id);
+-      std::string command = "explorer \"" + save_path + "\"";
+-      for (char& c : command)
+-        if (c == '/')
+-          c = '\\';
+-      std::system(command.c_str());
++      ImGui::TableNextRow();
++      ImGui::TableSetColumnIndex(0);
++      ImGui::TextUnformatted(binding[0]);
++      ImGui::TableSetColumnIndex(1);
++      ImGui::TextUnformatted(binding[1]);
+     }
++    ImGui::EndTable();
++  }
++
++  ImGui::Spacing();
++  ImGui::TextWrapped("Xbox, DualShock and DualSense controllers use the same profile. When SDL "
++                     "exposes gyro and accelerometer sensors, motion is passed through alongside "
++                     "the right-stick pointer fallback.");
++}
++
++void OnScreenUI::DrawSaveSettings()
++{
++  ImGui::TextUnformatted("Save data");
++  ImGui::TextDisabled("Backups are stored separately from the game's active Wii NAND data.");
++  ImGui::Spacing();
++
++  const u64 title_id = SConfig::GetInstance().GetTitleID();
++  if (ImGui::Button("Create backup", ImVec2(170.0f, 34.0f)))
++  {
++    const std::string save_path = Common::GetTitleDataPath(title_id) + "/";
++    const std::string backup_root = File::GetUserPath(D_BACKUP_IDX);
++    const std::string stamp = std::to_string(Common::Timer::NowMs());
++    const std::string destination = backup_root + "save-" + stamp + "/";
++    File::CreateFullPath(destination);
++    if (File::Copy(save_path, destination, true))
++      m_settings_status = "Save backed up to " + destination;
++    else
++      m_settings_status = "Backup failed. The game may not have created save data yet.";
++  }
++#ifdef _WIN32
++  ImGui::SameLine();
++  if (ImGui::Button("Open save folder", ImVec2(170.0f, 34.0f)))
++  {
++    std::string save_path = Common::GetTitleDataPath(title_id);
++    for (char& c : save_path)
++      if (c == '/')
++        c = '\\';
++    std::system(("explorer \"" + save_path + "\"").c_str());
++  }
+ #endif
+-    if (!m_settings_status.empty())
+-      ImGui::TextWrapped("%s", m_settings_status.c_str());
+-    ImGui::TextDisabled("The game keeps running behind this panel.");
++
++  if (!m_settings_status.empty())
++  {
++    ImGui::Spacing();
++    ImGui::TextWrapped("%s", m_settings_status.c_str());
+   }
+-  ImGui::End();
+-  if (!open)
+-    m_show_settings = false;
+ }
+ 
+ void OnScreenUI::Finalize()
+diff --git a/Source/Core/VideoCommon/OnScreenUI.h b/Source/Core/VideoCommon/OnScreenUI.h
+index 796e9c817622277b84e46f55da917b0d63aff62d..346506f0297eb6c337692ef77130cbb3a4525ee1 100644
+--- a/Source/Core/VideoCommon/OnScreenUI.h
++++ b/Source/Core/VideoCommon/OnScreenUI.h
+@@ -71,6 +71,11 @@ private:
+   void DrawDebugText();
+   void DrawChallengesAndLeaderboards();
+   void DrawSettingsPanel();
++  void DrawDisplaySettings();
++  void DrawGraphicsSettings();
++  void DrawPerformanceSettings();
++  void DrawControllerSettings();
++  void DrawSaveSettings();
+   void UpdateImguiTexture(ImTextureData* tex);
+ 
+   // ImGui resources.
+diff --git a/module-template/CMakeLists.txt b/module-template/CMakeLists.txt
+index 68f085d4e1a0cca1e69edf47cb6639ba950fb4b2..1bb45d3566ebcfad10f40f0922ee8ddd155ed1d6 100644
+--- a/module-template/CMakeLists.txt
++++ b/module-template/CMakeLists.txt
+@@ -88,5 +88,9 @@ elseif(MSVC)
+   # VS2022 default is fp:contract off) — the generated code encodes Gekko
+   # rounding explicitly, so fp:strict's exception/denormal bookkeeping only
+   # costs time. /GS- drops stack cookies in the leaf-heavy generated chunks.
+-  target_compile_options(${MODULE_NAME} PRIVATE /fp:precise /GS- /Ob3 /Gw)
++  target_compile_options(${MODULE_NAME} PRIVATE /fp:precise /GS- /Gw)
++  option(RECOMP_MODULE_LINK_MAP "Write an MSVC linker map for native profiling" OFF)
++  if(RECOMP_MODULE_LINK_MAP)
++    target_link_options(${MODULE_NAME} PRIVATE "/MAP:${CMAKE_CURRENT_BINARY_DIR}/${MODULE_NAME}.map")
++  endif()
+ endif()
+diff --git a/module-template/module_export.c b/module-template/module_export.c
+index e44a69edef1366152fa182f0459d658784b0054b..2f63d4c88b0064badba3402c8c7a029886a4b22a 100644
+--- a/module-template/module_export.c
++++ b/module-template/module_export.c
+@@ -10,7 +10,20 @@
+ 
+ static int chassis_dispatch(CPUState* ctx, u32 address)
+ {
+-    return dolrecomp_call(ctx, address);
++    u32 blocks = 0;
++
++    ctx->pc = address;
++    do
++    {
++        if (!dolrecomp_call(ctx, ctx->pc))
++            return blocks != 0u;
++        ++blocks;
++        if (ctx->pc == address)
++            break;
++    } while (!ctx->exception && ctx->dispatch_budget != 0 &&
++             ctx->downcount > -ctx->dispatch_budget && blocks < 65536u);
++
++    return 1;
+ }
+ 
+ static void chassis_on_state_loaded(CPUState* ctx)

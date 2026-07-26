@@ -1,0 +1,505 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 584eefe0e1fb2040add7063a96e47aaa84ee42e9..6acf8ad503c8974ed646e1c34633ad138c705bf9 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -195,6 +195,7 @@ target_link_libraries(moderngekko PUBLIC ModernGekko::ABI PRIVATE fmt::fmt)
+ if(MODERNGEKKO_ENABLE_DOLPHIN_RUNTIME)
+     target_sources(moderngekko PRIVATE
+         src/runtime/dolphin_runtime.cpp
++        tools/frontend_config.cpp
+         vendor/dolphin/Source/Core/DolphinNoGUI/Platform.cpp
+         vendor/dolphin/Source/Core/DolphinNoGUI/PlatformHeadless.cpp
+     )
+@@ -215,6 +216,7 @@ if(MODERNGEKKO_ENABLE_DOLPHIN_RUNTIME)
+         target_compile_definitions(moderngekko PRIVATE MODERNGEKKO_HAVE_COCOA=1)
+     endif()
+     target_include_directories(moderngekko PRIVATE
++        "${CMAKE_CURRENT_SOURCE_DIR}/tools"
+         "${CMAKE_CURRENT_SOURCE_DIR}/vendor/dolphin/GXRuntime/include")
+     if(CMAKE_SIZEOF_VOID_P EQUAL 8)
+         target_compile_definitions(moderngekko PRIVATE _ARCH_64=1)
+@@ -358,7 +360,6 @@ target_link_libraries(moderngekko-module-info
+ 
+ if(MODERNGEKKO_ENABLE_DOLPHIN_RUNTIME)
+     add_executable(moderngekko-run tools/moderngekko_run.cpp)
+-    target_sources(moderngekko-run PRIVATE tools/frontend_config.cpp)
+     target_include_directories(moderngekko-run PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/tools")
+     if(MODERNGEKKO_FRONTEND_SDK)
+         set_property(TARGET moderngekko-run PROPERTY BUILD_RPATH
+@@ -372,7 +373,6 @@ if(MODERNGEKKO_ENABLE_DOLPHIN_RUNTIME)
+ 
+     add_executable(moderngekko-launcher
+         tools/moderngekko_launcher.cpp
+-        tools/frontend_config.cpp
+         vendor/dolphin/Externals/imgui/imgui/backends/imgui_impl_sdl3.cpp
+         vendor/dolphin/Externals/imgui/imgui/backends/imgui_impl_sdlrenderer3.cpp)
+     target_include_directories(moderngekko-launcher PRIVATE
+diff --git a/include/moderngekko/cpu_state.h b/include/moderngekko/cpu_state.h
+index 5f562b8ef9ed2736ca88311c65b1a6065a896df5..b07f5f20ce487f56f30e26ac8ae41f1faf613698 100644
+--- a/include/moderngekko/cpu_state.h
++++ b/include/moderngekko/cpu_state.h
+@@ -8,7 +8,7 @@
+ extern "C" {
+ #endif
+ 
+-#define MODERNGEKKO_CPU_ABI_VERSION 2u
++#define MODERNGEKKO_CPU_ABI_VERSION 3u
+ #define GXRUNTIME_CPU_ABI_VERSION MODERNGEKKO_CPU_ABI_VERSION
+ 
+ typedef struct CPUState CPUState;
+@@ -70,6 +70,7 @@ struct CPUState
+     int64_t downcount;
+     uint8_t* exram;
+     uint32_t exram_size;
++    int64_t dispatch_budget;
+ };
+ 
+ #ifdef __cplusplus
+diff --git a/src/runtime/dolphin_runtime.cpp b/src/runtime/dolphin_runtime.cpp
+index 08a93a0d98cd112648892604360e0e92bc288e52..05e9f34cc1123df21203aaa06f5c98b74c35dec3 100644
+--- a/src/runtime/dolphin_runtime.cpp
++++ b/src/runtime/dolphin_runtime.cpp
+@@ -1,5 +1,7 @@
+ #include "moderngekko/runtime.hpp"
+ 
++#include "frontend_config.hpp"
++
+ #include "AudioCommon/AudioCommon.h"
+ #include "Common/Config/Config.h"
+ #include "Common/HookableEvent.h"
+@@ -49,6 +51,16 @@ Platform* s_platform = nullptr;
+ std::string s_window_title;
+ bool s_show_fps_in_title = true;
+ 
++std::string FrontendResolutionForScale(int scale)
++{
++  const auto& resolutions = moderngekko::frontend::SupportedResolutions();
++  const auto found = std::ranges::find(resolutions, scale,
++                                       &moderngekko::frontend::ResolutionOption::dolphin_scale);
++  if (found != resolutions.end())
++    return found->text;
++  return std::to_string(640 * scale) + "x" + std::to_string(528 * scale);
++}
++
+ template <typename T>
+ void AtomicMax(std::atomic<T>& target, T value)
+ {
+@@ -459,6 +471,18 @@ Runtime::~Runtime()
+     Core::Shutdown(Core::System::GetInstance());
+   }
+   m_impl->state_hook = {};
++  if (!m_impl->config.headless)
++  {
++    std::string error;
++    moderngekko::frontend::SaveConfig(
++        m_impl->config.user_directory,
++        FrontendResolutionForScale(Config::Get(Config::GFX_EFB_SCALE)),
++        m_impl->config.show_fps_in_title, Config::Get(Config::GFX_SHOW_FPS),
++        Config::Get(Config::GFX_MODS_ENABLE), Config::Get(Config::GFX_HIRES_TEXTURES),
++        moderngekko::frontend::ReadConfiguredController(m_impl->config.user_directory), &error);
++    if (!error.empty())
++      std::fprintf(stderr, "[moderngekko] could not save frontend settings: %s\n", error.c_str());
++  }
+   if (m_impl->controllers_initialized)
+     UICommon::ShutdownControllers();
+   if (m_impl->ui_initialized)
+diff --git a/tests/frontend_config_test.cpp b/tests/frontend_config_test.cpp
+index bef488e2d205f6ab6544ee9d2fdf515391a70cb7..b6eac6e62c3c80dc6436b12c42b09784e05fb0e0 100644
+--- a/tests/frontend_config_test.cpp
++++ b/tests/frontend_config_test.cpp
+@@ -28,6 +28,13 @@ int main()
+     return 2;
+   }
+ 
++  if (!moderngekko::frontend::SaveConfig(directory, "Auto", false, true, true, true,
++                                         controller, &error) ||
++      moderngekko::frontend::LoadConfig(directory, false).dolphin_scale != 0)
++  {
++    return 6;
++  }
++
+   if (!moderngekko::frontend::GenerateControllerConfig(directory, controller, &error))
+     return 3;
+   if (moderngekko::frontend::ReadConfiguredController(directory) != controller)
+diff --git a/tools/frontend_config.cpp b/tools/frontend_config.cpp
+index 1b62c164547ca3a4675d2d79eb98562858ee8a75..356a1a12eb6dc06c7f41782966e74d903eb754d6 100644
+--- a/tools/frontend_config.cpp
++++ b/tools/frontend_config.cpp
+@@ -43,8 +43,8 @@ const std::vector<ResolutionOption>& SupportedResolutions()
+ {
+   // These are the output-resolution labels used by Dolphin's integer EFB scales.
+   static const std::vector<ResolutionOption> resolutions = {
+-      {"640x528", 1},   {"1280x720", 2},  {"1920x1080", 3}, {"2560x1440", 4},
+-      {"3840x2160", 6}, {"5120x2880", 8}, {"7680x4320", 12},
++      {"Auto", 0},      {"640x528", 1},   {"1280x720", 2},  {"1920x1080", 3},
++      {"2560x1440", 4}, {"3840x2160", 6}, {"5120x2880", 8}, {"7680x4320", 12},
+   };
+   return resolutions;
+ }
+diff --git a/tools/moderngekko_launcher.cpp b/tools/moderngekko_launcher.cpp
+index ad31f51d3489907aa6a240e7918ad8f9c96438d0..659b9f22a101d309710ac88857c12da3a6fdb9c0 100644
+--- a/tools/moderngekko_launcher.cpp
++++ b/tools/moderngekko_launcher.cpp
+@@ -29,7 +29,7 @@ namespace fs = std::filesystem;
+ namespace
+ {
+ #ifndef MODERNGEKKO_FRONTEND_NAME
+-#define MODERNGEKKO_FRONTEND_NAME "ModernGekko"
++#define MODERNGEKKO_FRONTEND_NAME "Super Mario Galaxy PC"
+ #endif
+ 
+ #ifndef MODERNGEKKO_RUNNER_FILENAME
+@@ -143,36 +143,6 @@ bool WriteDefaultGame(const fs::path& user_directory, const fs::path& game, std:
+   return true;
+ }
+ 
+-std::vector<fs::path> FindDiscImages()
+-{
+-  std::vector<fs::path> images;
+-  std::error_code ec;
+-  const fs::path documents = DocumentsDirectory();
+-  if (!fs::is_directory(documents, ec))
+-    return images;
+-  fs::recursive_directory_iterator iterator(
+-      documents, fs::directory_options::skip_permission_denied, ec);
+-  const fs::recursive_directory_iterator end;
+-  while (iterator != end)
+-  {
+-    if (iterator.depth() > 4)
+-      iterator.disable_recursion_pending();
+-    if (iterator->is_regular_file(ec))
+-    {
+-      std::string extension = iterator->path().extension().string();
+-      std::ranges::transform(extension, extension.begin(),
+-                             [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+-      if (extension == ".wbfs" || extension == ".iso")
+-        images.push_back(iterator->path());
+-    }
+-    iterator.increment(ec);
+-    if (ec)
+-      ec.clear();
+-  }
+-  std::ranges::sort(images);
+-  return images;
+-}
+-
+ bool ExtractDisc(const fs::path& image, const fs::path& user_directory, ExtractionState* state)
+ {
+   auto fail = [&](std::string message) {
+@@ -415,7 +385,7 @@ int main(int argc, char** argv)
+ 
+   const float scale = SDL_GetDisplayContentScale(SDL_GetPrimaryDisplay());
+   SDL_Window* window = SDL_CreateWindow(
+-      MODERNGEKKO_FRONTEND_NAME, static_cast<int>(820 * scale), static_cast<int>(560 * scale),
++      MODERNGEKKO_FRONTEND_NAME, static_cast<int>(980 * scale), static_cast<int>(680 * scale),
+       SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY);
+   if (!window)
+   {
+@@ -440,14 +410,34 @@ int main(int argc, char** argv)
+   ImGuiIO& io = ImGui::GetIO();
+   io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
+   io.IniFilename = nullptr;
++#ifdef _WIN32
++  io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\segoeui.ttf", 17.0f);
++#endif
+   ImGui::StyleColorsDark();
+-  ImGui::GetStyle().ScaleAllSizes(scale);
+-  ImGui::GetStyle().FontScaleDpi = scale;
++  ImGuiStyle& style = ImGui::GetStyle();
++  style.WindowRounding = 12.0f;
++  style.ChildRounding = 10.0f;
++  style.FrameRounding = 6.0f;
++  style.WindowPadding = ImVec2(22.0f, 18.0f);
++  style.FramePadding = ImVec2(10.0f, 7.0f);
++  style.ItemSpacing = ImVec2(10.0f, 10.0f);
++  style.Colors[ImGuiCol_WindowBg] = ImVec4(0.025f, 0.035f, 0.060f, 1.00f);
++  style.Colors[ImGuiCol_ChildBg] = ImVec4(0.045f, 0.060f, 0.095f, 1.00f);
++  style.Colors[ImGuiCol_Header] = ImVec4(0.12f, 0.31f, 0.58f, 0.80f);
++  style.Colors[ImGuiCol_HeaderHovered] = ImVec4(0.16f, 0.42f, 0.76f, 0.90f);
++  style.Colors[ImGuiCol_HeaderActive] = ImVec4(0.19f, 0.49f, 0.88f, 1.00f);
++  style.Colors[ImGuiCol_Button] = ImVec4(0.11f, 0.28f, 0.52f, 0.90f);
++  style.Colors[ImGuiCol_ButtonHovered] = ImVec4(0.16f, 0.42f, 0.76f, 1.00f);
++  style.Colors[ImGuiCol_ButtonActive] = ImVec4(0.12f, 0.34f, 0.65f, 1.00f);
++  style.Colors[ImGuiCol_CheckMark] = ImVec4(0.34f, 0.73f, 1.00f, 1.00f);
++  style.Colors[ImGuiCol_FrameBg] = ImVec4(0.065f, 0.085f, 0.13f, 1.00f);
++  style.Colors[ImGuiCol_FrameBgHovered] = ImVec4(0.09f, 0.14f, 0.23f, 1.00f);
++  style.ScaleAllSizes(scale);
++  style.FontScaleDpi = scale;
+   ImGui_ImplSDL3_InitForSDLRenderer(window, renderer);
+   ImGui_ImplSDLRenderer3_Init(renderer);
+ 
+-  std::vector<fs::path> images = FindDiscImages();
+-  std::optional<fs::path> selected_image = images.empty() ? std::nullopt : std::optional(images[0]);
++  std::optional<fs::path> selected_image;
+   fs::path current_game = requested_game.value_or(ReadDefaultGame(user_directory));
+   auto current_metadata = moderngekko::InspectGame(current_game);
+   const auto& resolutions = moderngekko::frontend::SupportedResolutions();
+@@ -594,14 +584,22 @@ int main(int argc, char** argv)
+     ImGui::Begin(MODERNGEKKO_FRONTEND_NAME " Launcher", nullptr,
+                  ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
+                      ImGuiWindowFlags_NoSavedSettings);
++    ImGui::TextColored(ImVec4(0.34f, 0.73f, 1.00f, 1.00f), "PC RECOMPILATION");
++    ImGui::SameLine();
+     ImGui::TextUnformatted(MODERNGEKKO_FRONTEND_NAME);
++    ImGui::SameLine();
++    ImGui::TextDisabled("  RMGE01 / USA");
+     ImGui::Separator();
+ 
++    const float left_width = ImGui::GetContentRegionAvail().x * 0.57f;
++    ImGui::BeginChild("GamePanel", ImVec2(left_width, -38.0f * scale), true);
++    ImGui::TextColored(ImVec4(0.34f, 0.73f, 1.00f, 1.00f), "GAME");
+     if (current_metadata)
+     {
+-      ImGui::Text("Ready: %s [%s]", current_metadata.metadata->game_name.c_str(),
+-                  current_metadata.metadata->disc_id.c_str());
+-      if (ImGui::Button("Play", ImVec2(180 * scale, 42 * scale)))
++      ImGui::TextUnformatted(current_metadata.metadata->game_name.c_str());
++      ImGui::TextDisabled("Verified disc: %s", current_metadata.metadata->disc_id.c_str());
++      ImGui::Spacing();
++      if (ImGui::Button("PLAY", ImVec2(-1.0f, 46.0f * scale)))
+       {
+         if (controller_index < 0 || select_controller(controller_index))
+         {
+@@ -612,87 +610,13 @@ int main(int argc, char** argv)
+     }
+     else
+     {
+-      ImGui::TextUnformatted("No extracted game is configured yet.");
++      ImGui::TextUnformatted("No extracted game is ready.");
++      ImGui::TextDisabled("Choose your RMGE01 disc image below to create the private game data.");
+     }
+ 
+     ImGui::Spacing();
+-    ImGui::TextUnformatted("Internal resolution (Dolphin EFB upscale)");
+-    if (ImGui::BeginCombo("##resolution", selected_resolution.c_str()))
+-    {
+-      for (std::size_t i = 0; i < resolutions.size(); ++i)
+-      {
+-        const bool selected = resolution_index == static_cast<int>(i);
+-        if (ImGui::Selectable(resolutions[i].text, selected))
+-        {
+-          const int previous = resolution_index;
+-          const std::string previous_resolution = selected_resolution;
+-          resolution_index = static_cast<int>(i);
+-          selected_resolution = resolutions[i].text;
+-          if (!save_settings())
+-          {
+-            resolution_index = previous;
+-            selected_resolution = previous_resolution;
+-          }
+-        }
+-      }
+-      ImGui::EndCombo();
+-    }
+-    const bool previous_show_fps_in_title = show_fps_in_title;
+-    if (ImGui::Checkbox("Show FPS in window title", &show_fps_in_title))
+-    {
+-      if (!save_settings())
+-        show_fps_in_title = previous_show_fps_in_title;
+-    }
+-    const bool previous_overlay = show_performance_overlay;
+-    if (ImGui::Checkbox("Show FPS and emulation speed overlay", &show_performance_overlay) &&
+-        !save_settings())
+-      show_performance_overlay = previous_overlay;
+-    ImGui::TextDisabled("Simulation remains fixed at 60 Hz / 100%% speed.");
+-    const bool previous_mods = enable_graphics_mods;
+-    if (ImGui::Checkbox("Enable graphics mods", &enable_graphics_mods) && !save_settings())
+-      enable_graphics_mods = previous_mods;
+-    const bool previous_textures = load_custom_textures;
+-    if (ImGui::Checkbox("Load custom textures", &load_custom_textures) && !save_settings())
+-      load_custom_textures = previous_textures;
+-    ImGui::TextDisabled("Mods: Load/GraphicMods   Textures: Load/Textures/RMGE01");
+-    ImGui::Spacing();
+-    ImGui::TextUnformatted("Save data");
+-    if (ImGui::Button("Import save folder"))
+-    {
+-      dialog.purpose = DialogState::Purpose::ImportSave;
+-      SDL_ShowOpenFolderDialog(FileDialogCallback, &dialog, window, DocumentsDirectory().string().c_str(), false);
+-    }
+-    ImGui::SameLine();
+-    if (ImGui::Button("Export save folder"))
+-    {
+-      dialog.purpose = DialogState::Purpose::ExportSave;
+-      SDL_ShowOpenFolderDialog(FileDialogCallback, &dialog, window, DocumentsDirectory().string().c_str(), false);
+-    }
+-    if (!save_status.empty())
+-      ImGui::TextWrapped("%s", save_status.c_str());
+-    ImGui::Spacing();
+-    ImGui::TextUnformatted("Controller");
+-    const char* controller_preview =
+-        controller_index >= 0 ? controllers[controller_index].label.c_str() :
+-                                "No SDL gamepad detected";
+-    if (ImGui::BeginCombo("##controller", controller_preview))
+-    {
+-      for (std::size_t i = 0; i < controllers.size(); ++i)
+-      {
+-        const bool selected = controller_index == static_cast<int>(i);
+-        if (ImGui::Selectable(controllers[i].label.c_str(), selected) &&
+-            select_controller(static_cast<int>(i)))
+-        {
+-          controller_index = static_cast<int>(i);
+-        }
+-        if (selected)
+-          ImGui::SetItemDefaultFocus();
+-      }
+-      ImGui::EndCombo();
+-    }
+-    ImGui::TextDisabled("Galaxy layout: Wii Remote + Nunchuk");
+-    ImGui::Spacing();
+-    ImGui::TextUnformatted("Wii disc image");
++    ImGui::Separator();
++    ImGui::TextColored(ImVec4(0.34f, 0.73f, 1.00f, 1.00f), "GAME DATA");
+     if (selected_image)
+       ImGui::TextWrapped("%s", selected_image->string().c_str());
+     else
+@@ -700,7 +624,7 @@ int main(int argc, char** argv)
+ 
+     if (!extraction.running)
+     {
+-      if (ImGui::Button("Browse for WBFS / ISO"))
++      if (ImGui::Button("Choose WBFS / ISO"))
+       {
+         dialog.purpose = DialogState::Purpose::Disc;
+         static constexpr SDL_DialogFileFilter filters[] = {
+@@ -712,7 +636,7 @@ int main(int argc, char** argv)
+       if (selected_image)
+       {
+         ImGui::SameLine();
+-        if (ImGui::Button("Extract and Play"))
++        if (ImGui::Button("Extract and play"))
+         {
+           extraction.completed = 0;
+           extraction.total = 1;
+@@ -723,8 +647,9 @@ int main(int argc, char** argv)
+             extraction.finished_game.reset();
+           }
+           const fs::path image = *selected_image;
+-          extraction_thread = std::jthread(
+-              [image, user_directory, &extraction] { ExtractDisc(image, user_directory, &extraction); });
++          extraction_thread = std::jthread([image, user_directory, &extraction] {
++            ExtractDisc(image, user_directory, &extraction);
++          });
+         }
+       }
+     }
+@@ -732,9 +657,28 @@ int main(int argc, char** argv)
+     {
+       const float progress = std::min(1.0f, static_cast<float>(extraction.completed.load()) /
+                                                extraction.total.load());
+-      ImGui::ProgressBar(progress, ImVec2(-1, 0));
++      ImGui::ProgressBar(progress, ImVec2(-1.0f, 0.0f));
+     }
+ 
++    ImGui::Spacing();
++    ImGui::Separator();
++    ImGui::TextColored(ImVec4(0.34f, 0.73f, 1.00f, 1.00f), "SAVE DATA");
++    if (ImGui::Button("Import save folder"))
++    {
++      dialog.purpose = DialogState::Purpose::ImportSave;
++      SDL_ShowOpenFolderDialog(FileDialogCallback, &dialog, window,
++                               DocumentsDirectory().string().c_str(), false);
++    }
++    ImGui::SameLine();
++    if (ImGui::Button("Export save folder"))
++    {
++      dialog.purpose = DialogState::Purpose::ExportSave;
++      SDL_ShowOpenFolderDialog(FileDialogCallback, &dialog, window,
++                               DocumentsDirectory().string().c_str(), false);
++    }
++    if (!save_status.empty())
++      ImGui::TextWrapped("%s", save_status.c_str());
++
+     {
+       std::lock_guard lock(extraction.mutex);
+       if (!extraction.status.empty())
+@@ -747,12 +691,88 @@ int main(int argc, char** argv)
+       if (!dialog.error.empty())
+         ImGui::TextColored(ImVec4(1.0f, 0.35f, 0.3f, 1.0f), "%s", dialog.error.c_str());
+     }
++    ImGui::EndChild();
++
++    ImGui::SameLine();
++    ImGui::BeginChild("SettingsPanel", ImVec2(0.0f, -38.0f * scale), true);
++    ImGui::TextColored(ImVec4(0.34f, 0.73f, 1.00f, 1.00f), "QUICK SETTINGS");
++    ImGui::TextUnformatted("Internal resolution");
++    ImGui::SetNextItemWidth(-1.0f);
++    if (ImGui::BeginCombo("##resolution", selected_resolution.c_str()))
++    {
++      for (std::size_t i = 0; i < resolutions.size(); ++i)
++      {
++        const bool selected = resolution_index == static_cast<int>(i);
++        if (ImGui::Selectable(resolutions[i].text, selected))
++        {
++          const int previous = resolution_index;
++          const std::string previous_resolution = selected_resolution;
++          resolution_index = static_cast<int>(i);
++          selected_resolution = resolutions[i].text;
++          if (!save_settings())
++          {
++            resolution_index = previous;
++            selected_resolution = previous_resolution;
++          }
++        }
++      }
++      ImGui::EndCombo();
++    }
++    ImGui::TextDisabled("2x is recommended for Vega 11.");
++
++    ImGui::Spacing();
++    ImGui::TextUnformatted("Controller");
++    const char* controller_preview =
++        controller_index >= 0 ? controllers[controller_index].label.c_str() :
++                                "No SDL gamepad detected";
++    ImGui::SetNextItemWidth(-1.0f);
++    if (ImGui::BeginCombo("##controller", controller_preview))
++    {
++      for (std::size_t i = 0; i < controllers.size(); ++i)
++      {
++        const bool selected = controller_index == static_cast<int>(i);
++        if (ImGui::Selectable(controllers[i].label.c_str(), selected) &&
++            select_controller(static_cast<int>(i)))
++        {
++          controller_index = static_cast<int>(i);
++        }
++        if (selected)
++          ImGui::SetItemDefaultFocus();
++      }
++      ImGui::EndCombo();
++    }
++    ImGui::TextDisabled("Left stick: move  |  Right stick: pointer");
++
++    ImGui::Spacing();
++    ImGui::Separator();
++    ImGui::TextColored(ImVec4(0.34f, 0.73f, 1.00f, 1.00f), "OPTIONS");
++    const bool previous_show_fps_in_title = show_fps_in_title;
++    if (ImGui::Checkbox("Show FPS in window title", &show_fps_in_title))
++    {
++      if (!save_settings())
++        show_fps_in_title = previous_show_fps_in_title;
++    }
++    const bool previous_overlay = show_performance_overlay;
++    if (ImGui::Checkbox("Performance overlay", &show_performance_overlay) && !save_settings())
++      show_performance_overlay = previous_overlay;
++    const bool previous_mods = enable_graphics_mods;
++    if (ImGui::Checkbox("Graphics mods", &enable_graphics_mods) && !save_settings())
++      enable_graphics_mods = previous_mods;
++    const bool previous_textures = load_custom_textures;
++    if (ImGui::Checkbox("Custom HD textures", &load_custom_textures) && !save_settings())
++      load_custom_textures = previous_textures;
++
+     ImGui::Spacing();
+     ImGui::Separator();
+-    ImGui::TextWrapped("Controller: %s", controller_status.c_str());
++    ImGui::TextDisabled("Original 60 Hz simulation / 100%% speed");
++    if (!controller_status.empty())
++      ImGui::TextWrapped("%s", controller_status.c_str());
+ #ifdef MODERNGEKKO_FORCE_SIDEWAYS_WIIMOTE
+-    ImGui::TextDisabled("Forced profile: Galaxy (Wii Remote + Nunchuk)");
++    ImGui::TextDisabled("Galaxy Wii Remote + Nunchuk profile");
+ #endif
++    ImGui::EndChild();
++
++    ImGui::TextDisabled("F2 opens the full settings menu while playing.");
+     ImGui::End();
+ 
+     ImGui::Render();

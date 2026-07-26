@@ -1,0 +1,39 @@
+diff --git a/src/app/database.c b/src/app/database.c
+--- a/src/app/database.c
++++ b/src/app/database.c
+@@ -115,7 +115,7 @@ int database_titles_available(void) {
+ 
+ void print_database_missing_notice(void) {
+     fprintf(stderr,
+-            "database/titles.txt is missing; using GameCube mode. Run dolrecomp --setup to download it.\n");
++            "database/titles.txt is missing; Wii title name lookup is unavailable.\n");
+ }
+ 
+ int download_titles_database(const char* output_path) {
+diff --git a/src/backend/emitter.c b/src/backend/emitter.c
+--- a/src/backend/emitter.c
++++ b/src/backend/emitter.c
+@@ -396,7 +396,7 @@ void emit_header_for_cpu(FILE* out, DolRecompCPU cpu) {
+         "\n"
+         "#include <string.h>\n"
+         "#include <math.h>\n"
+-        "#include \"cpu/cpu.h\"\n"
++        "#include \"core/cpu.h\"\n"
+         "\n"
+         "static inline u32 dolrecomp_rotl32(u32 value, u32 sh) {\n"
+         "    sh &= 31u;\n"
+diff --git a/src/app/main.c b/src/app/main.c
+--- a/src/app/main.c
++++ b/src/app/main.c
+@@ -55,11 +55,6 @@ int main(int argc, char** argv) {
+     }
+     if (!titleless_mode && !database_titles_available()) {
+         print_database_missing_notice();
+-        effective_gamecube_mode = 1;
+-        titleless_mode = 1;
+-        if (!output_arg && title_id_arg && !is_title_id_length_valid(title_id_arg))
+-            output_arg = title_id_arg;
+-        title_id_arg = NULL;
+     }
+ 
+     if (!titleless_mode) {

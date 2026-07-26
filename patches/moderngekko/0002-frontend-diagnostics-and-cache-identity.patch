@@ -1,0 +1,1445 @@
+diff --git a/include/moderngekko/runtime.hpp b/include/moderngekko/runtime.hpp
+index db0620e..3a8dedc 100644
+--- a/include/moderngekko/runtime.hpp
++++ b/include/moderngekko/runtime.hpp
+@@ -3,6 +3,7 @@
+ #include "moderngekko/game.hpp"
+ #include "moderngekko/module_abi.h"
+ 
++#include <cstdint>
+ #include <filesystem>
+ #include <memory>
+ #include <optional>
+@@ -31,6 +32,9 @@ struct GraphicsSettings
+ {
+   std::string backend;
+   std::optional<int> internal_resolution_scale;
++  bool show_performance_overlay = false;
++  bool enable_graphics_mods = false;
++  bool load_custom_textures = false;
+ };
+ 
+ struct AudioSettings
+@@ -50,6 +54,14 @@ enum class WindowSystem
+   X11,
+ };
+ 
++enum class CpuEngine
++{
++  StaticRecompiler,
++  Jit,
++  CachedInterpreter,
++  Interpreter,
++};
++
+ struct RuntimeConfig
+ {
+   std::filesystem::path game_root;
+@@ -59,9 +71,16 @@ struct RuntimeConfig
+   AudioSettings audio;
+   InputSettings input;
+   WindowSystem window_system = WindowSystem::Default;
++  CpuEngine cpu_engine = CpuEngine::StaticRecompiler;
+   bool headless = false;
+   bool allow_interpreter = false;
+   bool show_fps_in_title = true;
++  bool trace_video = false;
++  std::optional<std::filesystem::path> capture_frame;
++  std::uint64_t capture_frame_after = 120;
++  std::optional<std::filesystem::path> gather_trace;
++  std::uint64_t gather_trace_bursts = 200000;
++  std::optional<std::uint32_t> idle_pc;
+   std::optional<std::string> window_title;
+ };
+ 
+diff --git a/src/runtime/dolphin_runtime.cpp b/src/runtime/dolphin_runtime.cpp
+index b35771c..08a93a0 100644
+--- a/src/runtime/dolphin_runtime.cpp
++++ b/src/runtime/dolphin_runtime.cpp
+@@ -10,13 +10,19 @@
+ #include "Core/Core.h"
+ #include "Core/Host.h"
+ #include "Core/HW/GBACore.h"
++#include "Core/HW/GPFifo.h"
+ #include "Core/PowerPC/JitInterface.h"
+ #include "Core/PowerPC/PowerPC.h"
+ #include "Core/PowerPC/StaticRecomp/StaticRecompModuleSource.h"
++#include "Core/Config/StaticRecompSettings.h"
+ #include "Core/System.h"
+ #include "DolphinNoGUI/Platform.h"
+ #include "UICommon/UICommon.h"
++#include "VideoCommon/FrameDumper.h"
+ #include "VideoCommon/PerformanceMetrics.h"
++#include "VideoCommon/Present.h"
++#include "VideoCommon/Statistics.h"
++#include "VideoCommon/VideoEvents.h"
+ #include "moderngekko/cpu_state.h"
+ #include "moderngekko/module_loader.hpp"
+ 
+@@ -25,6 +31,8 @@
+ #include <chrono>
+ #include <cmath>
+ #include <cstddef>
++#include <cstdint>
++#include <cstdio>
+ #include <fmt/format.h>
+ #include <mutex>
+ #include <thread>
+@@ -41,6 +49,150 @@ Platform* s_platform = nullptr;
+ std::string s_window_title;
+ bool s_show_fps_in_title = true;
+ 
++template <typename T>
++void AtomicMax(std::atomic<T>& target, T value)
++{
++  T current = target.load(std::memory_order_relaxed);
++  while (current < value &&
++         !target.compare_exchange_weak(current, value, std::memory_order_relaxed))
++  {
++  }
++}
++
++struct VideoTraceState
++{
++  std::atomic<std::uint64_t> before_frames{};
++  std::atomic<std::uint64_t> xfb_copies{};
++  std::atomic<std::uint64_t> vi_fields{};
++  std::atomic<std::uint64_t> present_requests{};
++  std::atomic<std::uint64_t> present_completions{};
++  std::atomic<std::uint64_t> valid_xfb_requests{};
++  std::atomic<std::uint64_t> blank_xfb_requests{};
++  std::atomic<std::uint64_t> unique_valid_presents{};
++  std::atomic<std::uint64_t> immediate_presents{};
++  std::atomic<std::uint64_t> vi_presents{};
++  std::atomic<std::uint64_t> duplicate_presents{};
++  std::atomic<std::uint64_t> total_draw_calls{};
++  std::atomic<std::uint64_t> total_primitives{};
++  std::atomic<std::uint64_t> total_vertices{};
++  std::atomic<std::uint64_t> total_rasterized_pixels{};
++  std::atomic<std::uint64_t> last_present_frame{};
++  std::atomic<std::uint64_t> last_present_ticks{};
++  std::atomic<std::uint32_t> last_xfb_address{};
++  std::atomic<std::uint32_t> last_xfb_width{};
++  std::atomic<std::uint32_t> last_xfb_stride{};
++  std::atomic<std::uint32_t> last_xfb_height{};
++  std::atomic<std::uint32_t> last_valid_xfb_address{};
++  std::atomic<std::uint32_t> last_valid_xfb_width{};
++  std::atomic<std::uint32_t> last_valid_xfb_stride{};
++  std::atomic<std::uint32_t> last_valid_xfb_height{};
++  std::atomic<int> last_draw_calls{};
++  std::atomic<int> max_draw_calls{};
++  std::atomic<int> last_primitives{};
++  std::atomic<int> max_primitives{};
++  std::atomic<int> last_vertices{};
++  std::atomic<int> max_vertices{};
++  std::atomic<int> last_rasterized_pixels{};
++  std::atomic<int> xfb_rect_left{};
++  std::atomic<int> xfb_rect_top{};
++  std::atomic<int> xfb_rect_right{};
++  std::atomic<int> xfb_rect_bottom{};
++  std::atomic<int> last_valid_xfb_rect_left{};
++  std::atomic<int> last_valid_xfb_rect_top{};
++  std::atomic<int> last_valid_xfb_rect_right{};
++  std::atomic<int> last_valid_xfb_rect_bottom{};
++  std::atomic<int> target_rect_left{};
++  std::atomic<int> target_rect_top{};
++  std::atomic<int> target_rect_right{};
++  std::atomic<int> target_rect_bottom{};
++  std::atomic<int> backbuffer_width{};
++  std::atomic<int> backbuffer_height{};
++  std::atomic<bool> has_xfb{};
++  std::atomic<bool> capture_requested{};
++  Common::EventHook before_frame_hook;
++  Common::EventHook after_frame_hook;
++  Common::EventHook vi_end_field_hook;
++  Common::EventHook before_present_hook;
++  Common::EventHook after_present_hook;
++
++  void ResetHooks()
++  {
++    before_frame_hook.reset();
++    after_frame_hook.reset();
++    vi_end_field_hook.reset();
++    before_present_hook.reset();
++    after_present_hook.reset();
++  }
++};
++
++void PrintVideoTraceSummary(const VideoTraceState& trace)
++{
++  const auto& metrics = Core::System::GetInstance().GetPerfMetrics();
++  std::fprintf(
++      stderr,
++      "[moderngekko-video] summary: before_frames=%llu xfb_copies=%llu vi_fields=%llu "
++      "present_requests=%llu present_completions=%llu valid_xfb=%llu blank_xfb=%llu "
++      "unique_valid=%llu immediate=%llu vi=%llu duplicate=%llu capture=%u\n",
++      static_cast<unsigned long long>(trace.before_frames.load(std::memory_order_relaxed)),
++      static_cast<unsigned long long>(trace.xfb_copies.load(std::memory_order_relaxed)),
++      static_cast<unsigned long long>(trace.vi_fields.load(std::memory_order_relaxed)),
++      static_cast<unsigned long long>(trace.present_requests.load(std::memory_order_relaxed)),
++      static_cast<unsigned long long>(trace.present_completions.load(std::memory_order_relaxed)),
++      static_cast<unsigned long long>(trace.valid_xfb_requests.load(std::memory_order_relaxed)),
++      static_cast<unsigned long long>(trace.blank_xfb_requests.load(std::memory_order_relaxed)),
++      static_cast<unsigned long long>(trace.unique_valid_presents.load(std::memory_order_relaxed)),
++      static_cast<unsigned long long>(trace.immediate_presents.load(std::memory_order_relaxed)),
++      static_cast<unsigned long long>(trace.vi_presents.load(std::memory_order_relaxed)),
++      static_cast<unsigned long long>(trace.duplicate_presents.load(std::memory_order_relaxed)),
++      trace.capture_requested.load(std::memory_order_relaxed) ? 1u : 0u);
++  std::fprintf(
++      stderr,
++      "[moderngekko-video] render: has_xfb=%u xfb=0x%08X size=%ux%u stride=%u "
++      "xfb_rect=%d,%d-%d,%d last_valid=0x%08X/%ux%u/%u valid_rect=%d,%d-%d,%d "
++      "target=%d,%d-%d,%d backbuffer=%dx%d efb=%ux%u "
++      "last_frame=%llu ticks=%llu draws=%d/%d/%llu primitives=%d/%d/%llu "
++      "vertices=%d/%d/%llu rasterized_pixels=%d/%llu fps=%.2f vps=%.2f speed=%.3f\n",
++      trace.has_xfb.load(std::memory_order_relaxed) ? 1u : 0u,
++      trace.last_xfb_address.load(std::memory_order_relaxed),
++      trace.last_xfb_width.load(std::memory_order_relaxed),
++      trace.last_xfb_height.load(std::memory_order_relaxed),
++      trace.last_xfb_stride.load(std::memory_order_relaxed),
++      trace.xfb_rect_left.load(std::memory_order_relaxed),
++      trace.xfb_rect_top.load(std::memory_order_relaxed),
++      trace.xfb_rect_right.load(std::memory_order_relaxed),
++      trace.xfb_rect_bottom.load(std::memory_order_relaxed),
++      trace.last_valid_xfb_address.load(std::memory_order_relaxed),
++      trace.last_valid_xfb_width.load(std::memory_order_relaxed),
++      trace.last_valid_xfb_height.load(std::memory_order_relaxed),
++      trace.last_valid_xfb_stride.load(std::memory_order_relaxed),
++      trace.last_valid_xfb_rect_left.load(std::memory_order_relaxed),
++      trace.last_valid_xfb_rect_top.load(std::memory_order_relaxed),
++      trace.last_valid_xfb_rect_right.load(std::memory_order_relaxed),
++      trace.last_valid_xfb_rect_bottom.load(std::memory_order_relaxed),
++      trace.target_rect_left.load(std::memory_order_relaxed),
++      trace.target_rect_top.load(std::memory_order_relaxed),
++      trace.target_rect_right.load(std::memory_order_relaxed),
++      trace.target_rect_bottom.load(std::memory_order_relaxed),
++      trace.backbuffer_width.load(std::memory_order_relaxed),
++      trace.backbuffer_height.load(std::memory_order_relaxed), metrics.GetEFBWidth(),
++      metrics.GetEFBHeight(),
++      static_cast<unsigned long long>(trace.last_present_frame.load(std::memory_order_relaxed)),
++      static_cast<unsigned long long>(trace.last_present_ticks.load(std::memory_order_relaxed)),
++      trace.last_draw_calls.load(std::memory_order_relaxed),
++      trace.max_draw_calls.load(std::memory_order_relaxed),
++      static_cast<unsigned long long>(trace.total_draw_calls.load(std::memory_order_relaxed)),
++      trace.last_primitives.load(std::memory_order_relaxed),
++      trace.max_primitives.load(std::memory_order_relaxed),
++      static_cast<unsigned long long>(trace.total_primitives.load(std::memory_order_relaxed)),
++      trace.last_vertices.load(std::memory_order_relaxed),
++      trace.max_vertices.load(std::memory_order_relaxed),
++      static_cast<unsigned long long>(trace.total_vertices.load(std::memory_order_relaxed)),
++      trace.last_rasterized_pixels.load(std::memory_order_relaxed),
++      static_cast<unsigned long long>(
++          trace.total_rasterized_pixels.load(std::memory_order_relaxed)),
++      metrics.GetFPS(), metrics.GetVPS(), metrics.GetSpeed());
++}
++
+ std::string FormatWindowTitle(const std::string& title, double fps)
+ {
+   if (!std::isfinite(fps) || fps < 0.0)
+@@ -100,6 +252,7 @@ struct Runtime::Impl
+   std::string title;
+   std::unique_ptr<Platform> platform;
+   Common::EventHook state_hook;
++  VideoTraceState video_trace;
+   bool ui_initialized = false;
+   bool controllers_initialized = false;
+   bool booted = false;
+@@ -144,7 +297,7 @@ RuntimeCreateResult Runtime::Create(RuntimeConfig config)
+     module_result = validation_library.Open(config.module.path.string(), requirements);
+   else if (config.module.kind == ModuleSource::Kind::AttachedDescriptor)
+     module_result = validation_library.Attach(config.module.descriptor, requirements);
+-  else if (!config.allow_interpreter)
++  else if (config.cpu_engine == CpuEngine::StaticRecompiler && !config.allow_interpreter)
+     return {{}, RuntimeError{RuntimeErrorCode::ModuleRequired,
+                              "no native module was supplied; use allow_interpreter explicitly"}};
+ 
+@@ -169,6 +322,27 @@ RuntimeCreateResult Runtime::Create(RuntimeConfig config)
+   impl->title = impl->config.window_title.value_or("ModernGekko - " + impl->metadata.game_name +
+                                                    " [" + impl->metadata.disc_id + "]");
+ 
++  if (impl->config.capture_frame)
++  {
++    std::error_code ec;
++    const auto parent = impl->config.capture_frame->parent_path();
++    if (!parent.empty())
++      std::filesystem::create_directories(parent, ec);
++    if (ec)
++      return {{}, RuntimeError{RuntimeErrorCode::InitializationFailed,
++                               "could not create frame capture directory: " + ec.message()}};
++  }
++  if (impl->config.gather_trace)
++  {
++    std::error_code ec;
++    const auto parent = impl->config.gather_trace->parent_path();
++    if (!parent.empty())
++      std::filesystem::create_directories(parent, ec);
++    if (ec)
++      return {{}, RuntimeError{RuntimeErrorCode::InitializationFailed,
++                               "could not create gather trace directory: " + ec.message()}};
++  }
++
+   UICommon::SetUserDirectory(impl->config.user_directory.string());
+   UICommon::Init();
+   impl->ui_initialized = true;
+@@ -203,13 +377,40 @@ RuntimeCreateResult Runtime::Create(RuntimeConfig config)
+   impl->controllers_initialized = true;
+   impl->platform->SetTitle(impl->title);
+ 
+-  Config::SetBase(Config::MAIN_CPU_CORE, PowerPC::CPUCore::StaticRecomp);
++  switch (impl->config.cpu_engine)
++  {
++  case CpuEngine::StaticRecompiler:
++    Config::SetBase(Config::MAIN_CPU_CORE, PowerPC::CPUCore::StaticRecomp);
++    break;
++  case CpuEngine::Jit:
++#if defined(_M_X64) || defined(__x86_64__)
++    Config::SetBase(Config::MAIN_CPU_CORE, PowerPC::CPUCore::JIT64);
++#elif defined(_M_ARM64) || defined(__aarch64__)
++    Config::SetBase(Config::MAIN_CPU_CORE, PowerPC::CPUCore::JITARM64);
++#else
++    Config::SetBase(Config::MAIN_CPU_CORE, PowerPC::CPUCore::CachedInterpreter);
++#endif
++    break;
++  case CpuEngine::CachedInterpreter:
++    Config::SetBase(Config::MAIN_CPU_CORE, PowerPC::CPUCore::CachedInterpreter);
++    break;
++  case CpuEngine::Interpreter:
++    Config::SetBase(Config::MAIN_CPU_CORE, PowerPC::CPUCore::Interpreter);
++    break;
++  }
++  Config::SetBase(Config::MAIN_STATICRECOMP_IDLE_PC, impl->config.idle_pc.value_or(0));
+   if (!impl->config.graphics.backend.empty())
+     Config::SetBase(Config::MAIN_GFX_BACKEND, impl->config.graphics.backend);
+   else if (impl->config.headless)
+     Config::SetBase(Config::MAIN_GFX_BACKEND, std::string("Null"));
+   if (impl->config.graphics.internal_resolution_scale)
+     Config::SetBase(Config::GFX_EFB_SCALE, *impl->config.graphics.internal_resolution_scale);
++  Config::SetBase(Config::GFX_SHOW_FPS, impl->config.graphics.show_performance_overlay);
++  Config::SetBase(Config::GFX_SHOW_SPEED, impl->config.graphics.show_performance_overlay);
++  Config::SetBase(Config::GFX_MODS_ENABLE, impl->config.graphics.enable_graphics_mods);
++  Config::SetBase(Config::GFX_HIRES_TEXTURES, impl->config.graphics.load_custom_textures);
++  // Galaxy's simulation remains fixed at its original 60 Hz cadence.
++  Config::SetBaseOrCurrent(Config::MAIN_EMULATION_SPEED, 1.0f);
+   const std::vector<std::string> audio_backends = AudioCommon::GetSoundBackends();
+   if (impl->config.headless)
+   {
+@@ -252,6 +453,9 @@ Runtime::~Runtime()
+   if (m_impl->booted)
+   {
+     Core::Stop(Core::System::GetInstance());
++    if (m_impl->config.trace_video)
++      PrintVideoTraceSummary(m_impl->video_trace);
++    m_impl->video_trace.ResetHooks();
+     Core::Shutdown(Core::System::GetInstance());
+   }
+   m_impl->state_hook = {};
+@@ -283,6 +487,7 @@ RuntimeRunResult Runtime::Run()
+     if (state == Core::State::Uninitialized && m_impl->platform)
+       m_impl->platform->Stop();
+   });
++  GPFifo::ConfigureBurstTrace(m_impl->config.gather_trace ? m_impl->config.gather_trace_bursts : 0);
+   if (!BootManager::BootCore(Core::System::GetInstance(), std::move(boot),
+                              m_impl->platform->GetWindowSystemInfo()))
+   {
+@@ -291,6 +496,119 @@ RuntimeRunResult Runtime::Run()
+             RuntimeError{RuntimeErrorCode::BootFailed, "Dolphin could not boot sys/main.dol"}};
+   }
+   m_impl->booted = true;
++  if (m_impl->config.trace_video || m_impl->config.capture_frame)
++  {
++    VideoTraceState* const trace = &m_impl->video_trace;
++    auto& events = Core::System::GetInstance().GetVideoEvents();
++    trace->before_frame_hook = events.before_frame_event.Register([trace] {
++      trace->before_frames.fetch_add(1, std::memory_order_relaxed);
++    });
++    trace->after_frame_hook = events.after_frame_event.Register([trace](Core::System&) {
++      const auto& stats = g_stats.this_frame;
++      const int draw_calls = std::max(stats.num_draw_calls, 0);
++      const int primitives =
++          std::max(stats.num_prims, 0) + std::max(stats.num_dl_prims, 0);
++      const int vertices = std::max(stats.num_vertices_loaded, 0);
++      const int rasterized_pixels = std::max(stats.rasterized_pixels, 0);
++      trace->xfb_copies.fetch_add(1, std::memory_order_relaxed);
++      trace->last_draw_calls.store(draw_calls, std::memory_order_relaxed);
++      trace->last_primitives.store(primitives, std::memory_order_relaxed);
++      trace->last_vertices.store(vertices, std::memory_order_relaxed);
++      trace->last_rasterized_pixels.store(rasterized_pixels, std::memory_order_relaxed);
++      trace->total_draw_calls.fetch_add(static_cast<std::uint64_t>(draw_calls),
++                                        std::memory_order_relaxed);
++      trace->total_primitives.fetch_add(static_cast<std::uint64_t>(primitives),
++                                        std::memory_order_relaxed);
++      trace->total_vertices.fetch_add(static_cast<std::uint64_t>(vertices),
++                                      std::memory_order_relaxed);
++      trace->total_rasterized_pixels.fetch_add(static_cast<std::uint64_t>(rasterized_pixels),
++                                               std::memory_order_relaxed);
++      AtomicMax(trace->max_draw_calls, draw_calls);
++      AtomicMax(trace->max_primitives, primitives);
++      AtomicMax(trace->max_vertices, vertices);
++    });
++    trace->vi_end_field_hook = events.vi_end_field_event.Register([trace] {
++      trace->vi_fields.fetch_add(1, std::memory_order_relaxed);
++    });
++    const auto capture_frame = m_impl->config.capture_frame;
++    const std::uint64_t capture_frame_after = m_impl->config.capture_frame_after;
++    trace->before_present_hook = events.before_present_event.Register(
++        [trace, capture_frame, capture_frame_after](const PresentInfo& info) {
++          trace->present_requests.fetch_add(1, std::memory_order_relaxed);
++          trace->last_present_frame.store(info.frame_count, std::memory_order_relaxed);
++          trace->last_present_ticks.store(info.emulated_timestamp, std::memory_order_relaxed);
++          switch (info.reason)
++          {
++          case PresentInfo::PresentReason::Immediate:
++            trace->immediate_presents.fetch_add(1, std::memory_order_relaxed);
++            break;
++          case PresentInfo::PresentReason::VideoInterface:
++            trace->vi_presents.fetch_add(1, std::memory_order_relaxed);
++            break;
++          case PresentInfo::PresentReason::VideoInterfaceDuplicate:
++            trace->duplicate_presents.fetch_add(1, std::memory_order_relaxed);
++            break;
++          }
++          if (!g_presenter)
++            return;
++          trace->has_xfb.store(g_presenter->HasXFB(), std::memory_order_relaxed);
++          trace->last_xfb_address.store(g_presenter->GetLastXFBAddress(),
++                                        std::memory_order_relaxed);
++          trace->last_xfb_width.store(g_presenter->GetLastXFBWidth(),
++                                      std::memory_order_relaxed);
++          trace->last_xfb_stride.store(g_presenter->GetLastXFBStride(),
++                                       std::memory_order_relaxed);
++          trace->last_xfb_height.store(g_presenter->GetLastXFBHeight(),
++                                       std::memory_order_relaxed);
++          const auto& xfb_rect = g_presenter->GetXFBRectangle();
++          trace->xfb_rect_left.store(xfb_rect.left, std::memory_order_relaxed);
++          trace->xfb_rect_top.store(xfb_rect.top, std::memory_order_relaxed);
++          trace->xfb_rect_right.store(xfb_rect.right, std::memory_order_relaxed);
++          trace->xfb_rect_bottom.store(xfb_rect.bottom, std::memory_order_relaxed);
++          if (g_presenter->HasXFB())
++          {
++            trace->valid_xfb_requests.fetch_add(1, std::memory_order_relaxed);
++            trace->last_valid_xfb_address.store(g_presenter->GetLastXFBAddress(),
++                                                std::memory_order_relaxed);
++            trace->last_valid_xfb_width.store(g_presenter->GetLastXFBWidth(),
++                                              std::memory_order_relaxed);
++            trace->last_valid_xfb_stride.store(g_presenter->GetLastXFBStride(),
++                                               std::memory_order_relaxed);
++            trace->last_valid_xfb_height.store(g_presenter->GetLastXFBHeight(),
++                                               std::memory_order_relaxed);
++            trace->last_valid_xfb_rect_left.store(xfb_rect.left, std::memory_order_relaxed);
++            trace->last_valid_xfb_rect_top.store(xfb_rect.top, std::memory_order_relaxed);
++            trace->last_valid_xfb_rect_right.store(xfb_rect.right, std::memory_order_relaxed);
++            trace->last_valid_xfb_rect_bottom.store(xfb_rect.bottom, std::memory_order_relaxed);
++            if (info.reason != PresentInfo::PresentReason::VideoInterfaceDuplicate)
++            {
++              const std::uint64_t unique_valid =
++                  trace->unique_valid_presents.fetch_add(1, std::memory_order_relaxed) + 1;
++              if (capture_frame && unique_valid >= capture_frame_after &&
++                  !trace->capture_requested.exchange(true, std::memory_order_relaxed))
++              {
++                g_frame_dumper->SaveScreenshot(capture_frame->string());
++              }
++            }
++          }
++          else
++          {
++            trace->blank_xfb_requests.fetch_add(1, std::memory_order_relaxed);
++          }
++          const auto& target_rect = g_presenter->GetTargetRectangle();
++          trace->target_rect_left.store(target_rect.left, std::memory_order_relaxed);
++          trace->target_rect_top.store(target_rect.top, std::memory_order_relaxed);
++          trace->target_rect_right.store(target_rect.right, std::memory_order_relaxed);
++          trace->target_rect_bottom.store(target_rect.bottom, std::memory_order_relaxed);
++          trace->backbuffer_width.store(g_presenter->GetBackbufferWidth(),
++                                        std::memory_order_relaxed);
++          trace->backbuffer_height.store(g_presenter->GetBackbufferHeight(),
++                                         std::memory_order_relaxed);
++        });
++    trace->after_present_hook = events.after_present_event.Register([trace](const PresentInfo&) {
++      trace->present_completions.fetch_add(1, std::memory_order_relaxed);
++    });
++  }
+   std::jthread title_thread;
+   if (!m_impl->config.headless && m_impl->config.show_fps_in_title)
+   {
+@@ -309,6 +627,27 @@ RuntimeRunResult Runtime::Run()
+     title_thread.join();
+   m_impl->platform->SaveWindowGeometry();
+   Core::Stop(Core::System::GetInstance());
++  if (m_impl->config.gather_trace)
++  {
++    const auto summary = GPFifo::GetBurstTraceSummary();
++    const bool saved = GPFifo::SaveBurstTrace(m_impl->config.gather_trace->string());
++    std::string last_data;
++    last_data.reserve(summary.last_data.size() * 2);
++    for (const u8 byte : summary.last_data)
++      last_data += fmt::format("{:02X}", byte);
++    std::fprintf(stderr,
++                 "[moderngekko-gather] %s bursts=%llu/%llu hash=0x%016llX "
++                 "context=0x%08X entry=0x%08X dispatch=%llu ticks=%llu data=%s path=%s\n",
++                 saved ? "saved" : "failed", (unsigned long long)summary.recorded_bursts,
++                 (unsigned long long)summary.requested_bursts,
++                 (unsigned long long)summary.final_hash, summary.last_context,
++                 summary.last_dispatch_entry, (unsigned long long)summary.last_dispatch,
++                 (unsigned long long)summary.last_ticks, last_data.c_str(),
++                 m_impl->config.gather_trace->string().c_str());
++  }
++  if (m_impl->config.trace_video)
++    PrintVideoTraceSummary(m_impl->video_trace);
++  m_impl->video_trace.ResetHooks();
+   Core::Shutdown(Core::System::GetInstance());
+   m_impl->booted = false;
+   m_impl->running = false;
+diff --git a/tests/frontend_config_test.cpp b/tests/frontend_config_test.cpp
+index b5a52b4..bef488e 100644
+--- a/tests/frontend_config_test.cpp
++++ b/tests/frontend_config_test.cpp
+@@ -16,12 +16,14 @@ int main()
+ 
+   std::string error;
+   const std::string controller = "SDL/0/Test Controller";
+-  if (!moderngekko::frontend::SaveConfig(directory, "1920x1080", false, controller, &error))
++  if (!moderngekko::frontend::SaveConfig(directory, "1920x1080", false, true, true, true,
++                                         controller, &error))
+     return 1;
+ 
+   const auto loaded = moderngekko::frontend::LoadConfig(directory, false);
+   if (!loaded || loaded.dolphin_scale != 3 || loaded.show_fps_in_title ||
+-      loaded.controller != controller)
++      !loaded.show_performance_overlay || !loaded.enable_graphics_mods ||
++      !loaded.load_custom_textures || loaded.controller != controller)
+   {
+     return 2;
+   }
+@@ -34,17 +36,19 @@ int main()
+   std::ifstream input(directory / "Config" / "WiimoteNew.ini");
+   const std::string generated{std::istreambuf_iterator<char>(input),
+                               std::istreambuf_iterator<char>()};
+-  if (!generated.contains("Buttons/A = `Shoulder L`\n") ||
+-      !generated.contains("Buttons/1 = `Button W`\n") ||
+-      !generated.contains("Buttons/2 = `Button S`\n") ||
+-      !generated.contains("Shake/X = `Trigger L`\n") ||
+-      !generated.contains("Extension = None\n") ||
+-      !generated.contains("Options/Sideways Wiimote = True\n") ||
+-      generated.contains("Nunchuk/"))
++  if (!generated.contains("Buttons/A = `Button S`\n") ||
++      !generated.contains("Buttons/B = `Button E` | `Trigger R`\n") ||
++      !generated.contains("IR/Up = `Right Y+`\n") ||
++      !generated.contains("Shake/X = `Button W`\n") ||
++      !generated.contains("Extension = Nunchuk\n") ||
++      !generated.contains("Nunchuk/Stick/Up = `Left Y+`\n") ||
++      !generated.contains("Nunchuk/Buttons/Z = `Trigger L`\n") ||
++      generated.contains("Options/Sideways Wiimote"))
+   {
+     return 5;
+   }
+ 
++  input.close();
+   fs::remove_all(directory);
+   return 0;
+ }
+diff --git a/tools/frontend_config.cpp b/tools/frontend_config.cpp
+index 0cf900e..1b62c16 100644
+--- a/tools/frontend_config.cpp
++++ b/tools/frontend_config.cpp
+@@ -11,6 +11,17 @@ namespace moderngekko::frontend
+ {
+ namespace
+ {
++bool ParseBool(std::string_view value, bool* result)
++{
++  if (value == "true" || value == "1" || value == "yes" || value == "on")
++    *result = true;
++  else if (value == "false" || value == "0" || value == "no" || value == "off")
++    *result = false;
++  else
++    return false;
++  return true;
++}
++
+ std::string Trim(std::string value)
+ {
+   const auto not_space = [](unsigned char c) { return !std::isspace(c); };
+@@ -44,7 +55,7 @@ ConfigResult LoadConfig(const fs::path& user_directory, bool create_if_missing)
+   if (!fs::exists(path) && create_if_missing)
+   {
+     std::string error;
+-    if (!SaveConfig(user_directory, "1920x1080", true, {}, &error))
++    if (!SaveConfig(user_directory, "1920x1080", true, false, false, false, {}, &error))
+       return {.error = std::move(error)};
+   }
+ 
+@@ -55,9 +66,19 @@ ConfigResult LoadConfig(const fs::path& user_directory, bool create_if_missing)
+   std::string resolution;
+   std::string controller;
+   bool show_fps_in_title = true;
++  bool show_performance_overlay = false;
++  bool enable_graphics_mods = false;
++  bool load_custom_textures = false;
+   std::string line;
++  bool first_line = true;
+   while (std::getline(file, line))
+   {
++    if (first_line)
++    {
++      first_line = false;
++      if (line.starts_with("\xEF\xBB\xBF"))
++        line.erase(0, 3);
++    }
+     if (!line.empty() && line.back() == '\r')
+       line.pop_back();
+     const std::string trimmed = Trim(line);
+@@ -75,13 +96,24 @@ ConfigResult LoadConfig(const fs::path& user_directory, bool create_if_missing)
+       controller = raw_value;
+     else if (key == "show_fps_in_title")
+     {
+-      if (value == "true" || value == "1" || value == "yes" || value == "on")
+-        show_fps_in_title = true;
+-      else if (value == "false" || value == "0" || value == "no" || value == "off")
+-        show_fps_in_title = false;
+-      else
++      if (!ParseBool(value, &show_fps_in_title))
+         return {.error = "show_fps_in_title must be true or false"};
+     }
++    else if (key == "show_performance_overlay")
++    {
++      if (!ParseBool(value, &show_performance_overlay))
++        return {.error = "show_performance_overlay must be true or false"};
++    }
++    else if (key == "enable_graphics_mods")
++    {
++      if (!ParseBool(value, &enable_graphics_mods))
++        return {.error = "enable_graphics_mods must be true or false"};
++    }
++    else if (key == "load_custom_textures")
++    {
++      if (!ParseBool(value, &load_custom_textures))
++        return {.error = "load_custom_textures must be true or false"};
++    }
+   }
+   if (resolution.empty())
+     return {.error = "config.ini is missing resolution=<width>x<height>"};
+@@ -92,7 +124,10 @@ ConfigResult LoadConfig(const fs::path& user_directory, bool create_if_missing)
+       return {.dolphin_scale = option.dolphin_scale,
+               .resolution = std::move(resolution),
+               .controller = std::move(controller),
+-              .show_fps_in_title = show_fps_in_title};
++              .show_fps_in_title = show_fps_in_title,
++              .show_performance_overlay = show_performance_overlay,
++              .enable_graphics_mods = enable_graphics_mods,
++              .load_custom_textures = load_custom_textures};
+   }
+ 
+   // Dolphin also accepts exact raw EFB multiples even when they do not have a common display label.
+@@ -103,7 +138,10 @@ ConfigResult LoadConfig(const fs::path& user_directory, bool create_if_missing)
+       return {.dolphin_scale = scale,
+               .resolution = std::move(resolution),
+               .controller = std::move(controller),
+-              .show_fps_in_title = show_fps_in_title};
++              .show_fps_in_title = show_fps_in_title,
++              .show_performance_overlay = show_performance_overlay,
++              .enable_graphics_mods = enable_graphics_mods,
++              .load_custom_textures = load_custom_textures};
+   }
+ 
+   return {.error = "unsupported Dolphin internal resolution '" + resolution +
+@@ -111,7 +149,9 @@ ConfigResult LoadConfig(const fs::path& user_directory, bool create_if_missing)
+ }
+ 
+ bool SaveConfig(const fs::path& user_directory, std::string_view resolution,
+-                bool show_fps_in_title, std::string_view controller, std::string* error)
++                bool show_fps_in_title, bool show_performance_overlay,
++                bool enable_graphics_mods, bool load_custom_textures,
++                std::string_view controller, std::string* error)
+ {
+   std::error_code ec;
+   fs::create_directories(user_directory, ec);
+@@ -133,8 +173,18 @@ bool SaveConfig(const fs::path& user_directory, std::string_view resolution,
+           "[Video]\n"
+           "resolution=" << resolution << '\n'
+        << "show_fps_in_title=" << (show_fps_in_title ? "true" : "false") << '\n'
++         << "show_performance_overlay=" << (show_performance_overlay ? "true" : "false") << '\n'
++         << "enable_graphics_mods=" << (enable_graphics_mods ? "true" : "false") << '\n'
++         << "load_custom_textures=" << (load_custom_textures ? "true" : "false") << '\n'
+        << "[Input]\n"
+        << "controller=" << controller << '\n';
++  file.flush();
++  if (!file)
++  {
++    if (error)
++      *error = "can't finish writing " + (user_directory / "config.ini").string();
++    return false;
++  }
+   return true;
+ }
+ 
+@@ -186,12 +236,16 @@ bool GenerateControllerConfig(const fs::path& user_directory, std::string_view c
+       *message = "can't write " + destination.string();
+     return false;
+   }
++  // Galaxy action layout: the pad's A and B buttons are the Wii Remote's A
++  // and B (right trigger doubles as B for shooting star bits), left stick
++  // drives the Nunchuk, right stick drives the pointer, left trigger is Z,
++  // left shoulder is C, west face is spin (shake).
+   output << "[Wiimote1]\n"
+          << "Device = " << controller << '\n'
+-         << "Buttons/A = `Shoulder L`\n"
+-            "Buttons/B = `Shoulder R`\n"
+-            "Buttons/1 = `Button W`\n"
+-            "Buttons/2 = `Button S`\n"
++         << "Buttons/A = `Button S`\n"
++            "Buttons/B = `Button E` | `Trigger R`\n"
++            "Buttons/1 = `Button N`\n"
++            "Buttons/2 = `Shoulder R`\n"
+             "Buttons/- = Back\n"
+             "Buttons/+ = Start\n"
+             "Buttons/Home = Guide\n"
+@@ -199,13 +253,13 @@ bool GenerateControllerConfig(const fs::path& user_directory, std::string_view c
+             "D-Pad/Down = `Pad S`\n"
+             "D-Pad/Left = `Pad W`\n"
+             "D-Pad/Right = `Pad E`\n"
+-            "IR/Up = `Cursor Y-`\n"
+-            "IR/Down = `Cursor Y+`\n"
+-            "IR/Left = `Cursor X-`\n"
+-            "IR/Right = `Cursor X+`\n"
+-            "Shake/X = `Trigger L`\n"
+-            "Shake/Y = `Trigger R`\n"
+-            "Shake/Z = `Trigger L`\n"
++            "IR/Up = `Right Y+`\n"
++            "IR/Down = `Right Y-`\n"
++            "IR/Left = `Right X-`\n"
++            "IR/Right = `Right X+`\n"
++            "Shake/X = `Button W`\n"
++            "Shake/Y = `Button W`\n"
++            "Shake/Z = `Button W`\n"
+             "IRPassthrough/Object 1 X = `IR Object 1 X`\n"
+             "IRPassthrough/Object 1 Y = `IR Object 1 Y`\n"
+             "IRPassthrough/Object 1 Size = `IR Object 1 Size`\n"
+@@ -231,8 +285,16 @@ bool GenerateControllerConfig(const fs::path& user_directory, std::string_view c
+             "IMUGyroscope/Yaw Left = `Gyro Yaw Left`\n"
+             "IMUGyroscope/Yaw Right = `Gyro Yaw Right`\n"
+             "Rumble/Motor = Motor\n"
+-            "Extension = None\n"
+-            "Options/Sideways Wiimote = True\n"
++            "Extension = Nunchuk\n"
++            "Nunchuk/Stick/Up = `Left Y+`\n"
++            "Nunchuk/Stick/Down = `Left Y-`\n"
++            "Nunchuk/Stick/Left = `Left X-`\n"
++            "Nunchuk/Stick/Right = `Left X+`\n"
++            "Nunchuk/Buttons/C = `Shoulder L`\n"
++            "Nunchuk/Buttons/Z = `Trigger L`\n"
++            "Nunchuk/Shake/X = `Button W`\n"
++            "Nunchuk/Shake/Y = `Button W`\n"
++            "Nunchuk/Shake/Z = `Button W`\n"
+             "[Wiimote2]\n"
+             "[Wiimote3]\n"
+             "[Wiimote4]\n"
+@@ -244,7 +306,7 @@ bool GenerateControllerConfig(const fs::path& user_directory, std::string_view c
+     return false;
+   }
+   if (message)
+-    *message = "Sideways Wii Remote mapped to " + std::string(controller);
++    *message = "Galaxy profile (Wii Remote + Nunchuk) mapped to " + std::string(controller);
+   return true;
+ }
+ }  // namespace moderngekko::frontend
+diff --git a/tools/frontend_config.hpp b/tools/frontend_config.hpp
+index c5d9eae..802b783 100644
+--- a/tools/frontend_config.hpp
++++ b/tools/frontend_config.hpp
+@@ -19,6 +19,9 @@ struct ConfigResult
+   std::string resolution;
+   std::string controller;
+   bool show_fps_in_title = true;
++  bool show_performance_overlay = false;
++  bool enable_graphics_mods = false;
++  bool load_custom_textures = false;
+   std::string error;
+ 
+   explicit operator bool() const { return error.empty(); }
+@@ -27,7 +30,9 @@ struct ConfigResult
+ const std::vector<ResolutionOption>& SupportedResolutions();
+ ConfigResult LoadConfig(const std::filesystem::path& user_directory, bool create_if_missing);
+ bool SaveConfig(const std::filesystem::path& user_directory, std::string_view resolution,
+-                bool show_fps_in_title, std::string_view controller, std::string* error);
++                bool show_fps_in_title, bool show_performance_overlay,
++                bool enable_graphics_mods, bool load_custom_textures,
++                std::string_view controller, std::string* error);
+ std::string ReadConfiguredController(const std::filesystem::path& user_directory);
+ bool GenerateControllerConfig(const std::filesystem::path& user_directory,
+                               std::string_view controller, std::string* message);
+diff --git a/tools/moderngekko_launcher.cpp b/tools/moderngekko_launcher.cpp
+index 5875ea1..ad31f51 100644
+--- a/tools/moderngekko_launcher.cpp
++++ b/tools/moderngekko_launcher.cpp
+@@ -1,4 +1,4 @@
+-#include "frontend_config.hpp"
++﻿#include "frontend_config.hpp"
+ #include "moderngekko/game.hpp"
+ 
+ #include "DiscIO/DiscExtractor.h"
+@@ -12,6 +12,7 @@
+ 
+ #include <algorithm>
+ #include <atomic>
++#include <chrono>
+ #include <cstdlib>
+ #include <filesystem>
+ #include <fstream>
+@@ -54,6 +55,13 @@ struct DialogState
+ {
+   std::mutex mutex;
+   std::optional<fs::path> selected;
++  enum class Purpose
++  {
++    Disc,
++    ImportSave,
++    ExportSave,
++  };
++  Purpose purpose = Purpose::Disc;
+   std::string error;
+ };
+ 
+@@ -275,12 +283,67 @@ void SDLCALL FileDialogCallback(void* userdata, const char* const* filelist, int
+     state->selected = filelist[0];
+ }
+ 
++fs::path GalaxySaveDirectory(const fs::path& user_directory)
++{
++  return user_directory / "Wii" / "title" / "00010000" / "524d4745" / "data";
++}
++
++bool CopyDirectoryContents(const fs::path& source, const fs::path& destination,
++                           bool require_existing_source, std::string* message)
++{
++  std::error_code ec;
++  if (!fs::is_directory(source, ec))
++  {
++    if (message)
++      *message = require_existing_source ? "save directory not found: " + source.string() :
++                                           "selected path is not a directory";
++    return false;
++  }
++  const fs::path staging = destination.string() + ".copying";
++  fs::remove_all(staging, ec);
++  ec.clear();
++  fs::create_directories(staging, ec);
++  if (ec)
++  {
++    if (message)
++      *message = "can't create destination: " + ec.message();
++    return false;
++  }
++  fs::copy(source, staging,
++           fs::copy_options::recursive | fs::copy_options::overwrite_existing, ec);
++  if (ec)
++  {
++    if (message)
++      *message = "save copy failed: " + ec.message();
++    return false;
++  }
++  fs::remove_all(destination, ec);
++  ec.clear();
++  fs::rename(staging, destination, ec);
++  if (ec)
++  {
++    if (message)
++      *message = "can't publish save copy: " + ec.message();
++    return false;
++  }
++  if (message)
++    *message = "Save copied to " + destination.string();
++  return true;
++}
++
+ std::string Quote(const fs::path& path)
+ {
++#if defined(_WIN32)
++  std::string result = "\"";
++  for (char c : path.string())
++    result += c == '\"' ? "\\\"" : std::string(1, c);
++  return result + "\"";
++#else
+   std::string result = "'";
+   for (char c : path.string())
+     result += c == '\'' ? "'\\''" : std::string(1, c);
+   return result + "'";
++#endif
+ }
+ 
+ fs::path SiblingRunner(const char* argv0)
+@@ -296,6 +359,10 @@ int main(int argc, char** argv)
+ {
+   bool use_wayland = false;
+   std::optional<fs::path> extract_only;
++  std::optional<fs::path> requested_user_directory;
++  std::optional<fs::path> requested_game;
++  std::optional<fs::path> requested_module;
++  std::string requested_graphics;
+   for (int i = 1; i < argc; ++i)
+   {
+     if (std::string_view(argv[i]) == "-X11" || std::string_view(argv[i]) == "--x11")
+@@ -304,9 +371,17 @@ int main(int argc, char** argv)
+       use_wayland = true;
+     else if (std::string_view(argv[i]) == "--extract" && i + 1 < argc)
+       extract_only = argv[++i];
++    else if (std::string_view(argv[i]) == "--user-dir" && i + 1 < argc)
++      requested_user_directory = argv[++i];
++    else if (std::string_view(argv[i]) == "--game" && i + 1 < argc)
++      requested_game = argv[++i];
++    else if (std::string_view(argv[i]) == "--module" && i + 1 < argc)
++      requested_module = argv[++i];
++    else if (std::string_view(argv[i]) == "--graphics" && i + 1 < argc)
++      requested_graphics = argv[++i];
+   }
+ 
+-  const fs::path user_directory = DefaultUserDirectory();
++  const fs::path user_directory = requested_user_directory.value_or(DefaultUserDirectory());
+   if (extract_only)
+   {
+     ExtractionState extraction;
+@@ -329,9 +404,14 @@ int main(int argc, char** argv)
+     return 2;
+   }
+ 
++#if defined(__linux__)
+   SDL_SetHint(SDL_HINT_VIDEO_DRIVER, use_wayland ? "wayland" : "x11");
++#endif
+   if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD))
++  {
++    std::cerr << "SDL initialization failed: " << SDL_GetError() << '\n';
+     return 1;
++  }
+ 
+   const float scale = SDL_GetDisplayContentScale(SDL_GetPrimaryDisplay());
+   SDL_Window* window = SDL_CreateWindow(
+@@ -368,11 +448,15 @@ int main(int argc, char** argv)
+ 
+   std::vector<fs::path> images = FindDiscImages();
+   std::optional<fs::path> selected_image = images.empty() ? std::nullopt : std::optional(images[0]);
+-  fs::path current_game = ReadDefaultGame(user_directory);
++  fs::path current_game = requested_game.value_or(ReadDefaultGame(user_directory));
+   auto current_metadata = moderngekko::InspectGame(current_game);
+   const auto& resolutions = moderngekko::frontend::SupportedResolutions();
+   bool show_fps_in_title = config.show_fps_in_title;
++  bool show_performance_overlay = config.show_performance_overlay;
++  bool enable_graphics_mods = config.enable_graphics_mods;
++  bool load_custom_textures = config.load_custom_textures;
+   int resolution_index = 0;
++  std::string selected_resolution = config.resolution;
+   for (std::size_t i = 0; i < resolutions.size(); ++i)
+   {
+     if (config.resolution == resolutions[i].text)
+@@ -386,6 +470,20 @@ int main(int argc, char** argv)
+     selected_controller = moderngekko::frontend::ReadConfiguredController(user_directory);
+   int controller_index = FindController(controllers, selected_controller);
+   std::string controller_status;
++  std::string save_status;
++  const auto save_settings = [&] {
++    std::string error;
++    if (!moderngekko::frontend::SaveConfig(
++            user_directory, selected_resolution, show_fps_in_title,
++            show_performance_overlay, enable_graphics_mods, load_custom_textures,
++            selected_controller, &error))
++    {
++      std::lock_guard lock(dialog.mutex);
++      dialog.error = std::move(error);
++      return false;
++    }
++    return true;
++  };
+   const auto select_controller = [&](int index) {
+     std::string message;
+     if (!moderngekko::frontend::GenerateControllerConfig(user_directory,
+@@ -395,16 +493,9 @@ int main(int argc, char** argv)
+       dialog.error = std::move(message);
+       return false;
+     }
+-    std::string error;
+-    if (!moderngekko::frontend::SaveConfig(user_directory,
+-                                           resolutions[resolution_index].text,
+-                                           show_fps_in_title, controllers[index].device, &error))
+-    {
+-      std::lock_guard lock(dialog.mutex);
+-      dialog.error = std::move(error);
+-      return false;
+-    }
+     selected_controller = controllers[index].device;
++    if (!save_settings())
++      return false;
+     controller_status = std::move(message);
+     return true;
+   };
+@@ -452,7 +543,33 @@ int main(int argc, char** argv)
+       std::lock_guard lock(dialog.mutex);
+       if (dialog.selected)
+       {
+-        selected_image = std::move(dialog.selected);
++        const fs::path selected = *dialog.selected;
++        if (dialog.purpose == DialogState::Purpose::Disc)
++          selected_image = selected;
++        else if (dialog.purpose == DialogState::Purpose::ImportSave)
++        {
++          const fs::path source = fs::is_directory(selected / "data") ? selected / "data" : selected;
++          const fs::path destination = GalaxySaveDirectory(user_directory);
++          const auto stamp = std::chrono::system_clock::now().time_since_epoch().count();
++          const fs::path backup = user_directory / "Backup" /
++                                  ("RMGE01-before-import-" + std::to_string(stamp));
++          std::string message;
++          if (fs::is_directory(destination) && !CopyDirectoryContents(destination, backup, true, &message))
++            dialog.error = std::move(message);
++          else if (!CopyDirectoryContents(source, destination, true, &message))
++            dialog.error = std::move(message);
++          else
++            save_status = "Save imported; previous save backed up when present.";
++        }
++        else
++        {
++          std::string message;
++          if (!CopyDirectoryContents(GalaxySaveDirectory(user_directory),
++                                     selected / "RMGE01-save" / "data", true, &message))
++            dialog.error = std::move(message);
++          else
++            save_status = std::move(message);
++        }
+         dialog.selected.reset();
+       }
+     }
+@@ -463,16 +580,8 @@ int main(int argc, char** argv)
+         current_game = *extraction.finished_game;
+         current_metadata = moderngekko::InspectGame(current_game);
+         extraction.finished_game.reset();
+-        if (controller_index >= 0)
+-        {
+-          launch = true;
+-          done = true;
+-        }
+-        else
+-        {
+-          std::lock_guard dialog_lock(dialog.mutex);
+-          dialog.error = "Connect an SDL-compatible controller before playing";
+-        }
++        launch = true;
++        done = true;
+       }
+     }
+ 
+@@ -494,12 +603,7 @@ int main(int argc, char** argv)
+                   current_metadata.metadata->disc_id.c_str());
+       if (ImGui::Button("Play", ImVec2(180 * scale, 42 * scale)))
+       {
+-        if (controller_index < 0)
+-        {
+-          std::lock_guard lock(dialog.mutex);
+-          dialog.error = "Connect an SDL-compatible controller before playing";
+-        }
+-        else if (select_controller(controller_index))
++        if (controller_index < 0 || select_controller(controller_index))
+         {
+           launch = true;
+           done = true;
+@@ -513,21 +617,21 @@ int main(int argc, char** argv)
+ 
+     ImGui::Spacing();
+     ImGui::TextUnformatted("Internal resolution (Dolphin EFB upscale)");
+-    if (ImGui::BeginCombo("##resolution", resolutions[resolution_index].text))
++    if (ImGui::BeginCombo("##resolution", selected_resolution.c_str()))
+     {
+       for (std::size_t i = 0; i < resolutions.size(); ++i)
+       {
+         const bool selected = resolution_index == static_cast<int>(i);
+         if (ImGui::Selectable(resolutions[i].text, selected))
+         {
+-          std::string error;
+-          if (moderngekko::frontend::SaveConfig(user_directory, resolutions[i].text,
+-                                                show_fps_in_title, selected_controller, &error))
+-            resolution_index = static_cast<int>(i);
+-          else
++          const int previous = resolution_index;
++          const std::string previous_resolution = selected_resolution;
++          resolution_index = static_cast<int>(i);
++          selected_resolution = resolutions[i].text;
++          if (!save_settings())
+           {
+-            std::lock_guard lock(dialog.mutex);
+-            dialog.error = std::move(error);
++            resolution_index = previous;
++            selected_resolution = previous_resolution;
+           }
+         }
+       }
+@@ -536,16 +640,36 @@ int main(int argc, char** argv)
+     const bool previous_show_fps_in_title = show_fps_in_title;
+     if (ImGui::Checkbox("Show FPS in window title", &show_fps_in_title))
+     {
+-      std::string error;
+-      if (!moderngekko::frontend::SaveConfig(user_directory,
+-                                             resolutions[resolution_index].text,
+-                                             show_fps_in_title, selected_controller, &error))
+-      {
++      if (!save_settings())
+         show_fps_in_title = previous_show_fps_in_title;
+-        std::lock_guard lock(dialog.mutex);
+-        dialog.error = std::move(error);
+-      }
+     }
++    const bool previous_overlay = show_performance_overlay;
++    if (ImGui::Checkbox("Show FPS and emulation speed overlay", &show_performance_overlay) &&
++        !save_settings())
++      show_performance_overlay = previous_overlay;
++    ImGui::TextDisabled("Simulation remains fixed at 60 Hz / 100%% speed.");
++    const bool previous_mods = enable_graphics_mods;
++    if (ImGui::Checkbox("Enable graphics mods", &enable_graphics_mods) && !save_settings())
++      enable_graphics_mods = previous_mods;
++    const bool previous_textures = load_custom_textures;
++    if (ImGui::Checkbox("Load custom textures", &load_custom_textures) && !save_settings())
++      load_custom_textures = previous_textures;
++    ImGui::TextDisabled("Mods: Load/GraphicMods   Textures: Load/Textures/RMGE01");
++    ImGui::Spacing();
++    ImGui::TextUnformatted("Save data");
++    if (ImGui::Button("Import save folder"))
++    {
++      dialog.purpose = DialogState::Purpose::ImportSave;
++      SDL_ShowOpenFolderDialog(FileDialogCallback, &dialog, window, DocumentsDirectory().string().c_str(), false);
++    }
++    ImGui::SameLine();
++    if (ImGui::Button("Export save folder"))
++    {
++      dialog.purpose = DialogState::Purpose::ExportSave;
++      SDL_ShowOpenFolderDialog(FileDialogCallback, &dialog, window, DocumentsDirectory().string().c_str(), false);
++    }
++    if (!save_status.empty())
++      ImGui::TextWrapped("%s", save_status.c_str());
+     ImGui::Spacing();
+     ImGui::TextUnformatted("Controller");
+     const char* controller_preview =
+@@ -566,7 +690,7 @@ int main(int argc, char** argv)
+       }
+       ImGui::EndCombo();
+     }
+-    ImGui::TextDisabled("Sideways Wii Remote layout");
++    ImGui::TextDisabled("Galaxy layout: Wii Remote + Nunchuk");
+     ImGui::Spacing();
+     ImGui::TextUnformatted("Wii disc image");
+     if (selected_image)
+@@ -578,6 +702,7 @@ int main(int argc, char** argv)
+     {
+       if (ImGui::Button("Browse for WBFS / ISO"))
+       {
++        dialog.purpose = DialogState::Purpose::Disc;
+         static constexpr SDL_DialogFileFilter filters[] = {
+             {"Wii disc images", "wbfs;iso"}, {"WBFS", "wbfs"}, {"ISO", "iso"}};
+         const std::string documents = DocumentsDirectory().string();
+@@ -626,7 +751,7 @@ int main(int argc, char** argv)
+     ImGui::Separator();
+     ImGui::TextWrapped("Controller: %s", controller_status.c_str());
+ #ifdef MODERNGEKKO_FORCE_SIDEWAYS_WIIMOTE
+-    ImGui::TextDisabled("Forced profile: Sideways Wii Remote, Extension: None");
++    ImGui::TextDisabled("Forced profile: Galaxy (Wii Remote + Nunchuk)");
+ #endif
+     ImGui::End();
+ 
+@@ -654,6 +779,10 @@ int main(int argc, char** argv)
+     return 1;
+   std::string command = Quote(SiblingRunner(argv[0])) + " --game " + Quote(current_game) +
+                         " --user-dir " + Quote(user_directory);
++  if (requested_module)
++    command += " --module " + Quote(*requested_module);
++  if (!requested_graphics.empty())
++    command += " --graphics " + Quote(requested_graphics);
+   if (use_wayland)
+     command += " --wayland";
+   return std::system(command.c_str()) == 0 ? 0 : 1;
+diff --git a/tools/moderngekko_port.cpp b/tools/moderngekko_port.cpp
+index ab2b33e..0e46c76 100644
+--- a/tools/moderngekko_port.cpp
++++ b/tools/moderngekko_port.cpp
+@@ -2,6 +2,7 @@
+ #include "moderngekko/module_abi.h"
+ 
+ #include <algorithm>
++#include <cctype>
+ #include <cstdio>
+ #include <cstdlib>
+ #include <filesystem>
+@@ -19,9 +20,10 @@ namespace fs = std::filesystem;
+ 
+ namespace
+ {
+-constexpr std::string_view RECOMPCORE_REVISION = "6ed835397d984f2ac8cccb89589ef592add68d71";
++constexpr std::string_view RECOMPCORE_REVISION = "1873066167f3d03b39771b547f280d2b970427b6";
+ constexpr std::string_view DOLRECOMP_REVISION =
+-    "a2b02e5a515fc8971cc551ad51c9e26a9815daad-dispatch-port";
++    "3606fbd226951631fd258e81fb26854ae9bbd21f";
++constexpr std::string_view MODULE_PATCHSET_REVISION = "smgrecomp-20260716.1";
+ 
+ struct BuildOptions
+ {
+@@ -72,6 +74,45 @@ std::uint64_t Fnv1a(std::string_view value)
+   return hash;
+ }
+ 
++std::optional<std::uint64_t> Fnv1aFile(const fs::path& path)
++{
++  std::ifstream file(path, std::ios::binary);
++  if (!file)
++    return std::nullopt;
++
++  std::uint64_t hash = 0xcbf29ce484222325ULL;
++  char buffer[64 * 1024];
++  while (file)
++  {
++    file.read(buffer, sizeof(buffer));
++    for (std::streamsize i = 0; i < file.gcount(); ++i)
++      hash = (hash ^ static_cast<unsigned char>(buffer[i])) * 0x100000001b3ULL;
++  }
++  return hash;
++}
++
++std::string FindVersion(std::string_view text)
++{
++  for (std::size_t start = 0; start < text.size(); ++start)
++  {
++    if (!std::isdigit(static_cast<unsigned char>(text[start])))
++      continue;
++
++    std::size_t end = start;
++    unsigned dots = 0;
++    while (end < text.size() &&
++           (std::isdigit(static_cast<unsigned char>(text[end])) || text[end] == '.'))
++    {
++      dots += text[end] == '.';
++      ++end;
++    }
++    if (dots >= 2)
++      return std::string(text.substr(start, end - start));
++    start = end;
++  }
++  return {};
++}
++
+ std::string ReadCommand(const std::string& command)
+ {
+ #if defined(_WIN32)
+@@ -211,12 +252,34 @@ std::optional<fs::path> Build(const char* argv0, const fs::path& root,
+     return std::nullopt;
+   }
+ 
+-  const std::string compiler_identity = ReadCommand(compiler + " --version 2>&1");
+-  if (compiler_identity.empty())
++  const fs::path dolrecomp = SiblingExecutable(argv0, "dolrecomp");
++  const auto dolrecomp_binary_hash = Fnv1aFile(dolrecomp);
++  if (!dolrecomp_binary_hash)
++  {
++    std::cerr << "unable to fingerprint DolRecomp: " << dolrecomp << '\n';
++    return std::nullopt;
++  }
++  std::ostringstream dolrecomp_binary_identity;
++  dolrecomp_binary_identity << std::hex << std::setfill('0') << std::setw(16)
++                            << *dolrecomp_binary_hash;
++
++  const std::string compiler_output = ReadCommand(compiler + " --version 2>&1");
++  if (compiler_output.empty())
+   {
+     std::cerr << "compiler is unavailable: " << compiler << '\n';
+     return std::nullopt;
+   }
++  std::string compiler_identity = compiler_output;
++  if (compiler == "cl")
++  {
++    const std::string version = FindVersion(compiler_output);
++    if (version.empty())
++    {
++      std::cerr << "unable to determine the MSVC compiler version\n";
++      return std::nullopt;
++    }
++    compiler_identity = "msvc-" + version;
++  }
+ #if defined(__x86_64__) || defined(_M_X64)
+   constexpr std::string_view architecture = "x86_64";
+ #elif defined(__aarch64__) || defined(_M_ARM64)
+@@ -242,7 +305,9 @@ std::optional<fs::path> Build(const char* argv0, const fs::path& root,
+     flags = "compile:/O2 /fp:strict";
+   }
+   const std::string identity = std::string(RECOMPCORE_REVISION) + "|dolrecomp=" +
+-      std::string(DOLRECOMP_REVISION) + "|module-abi=" +
++      std::string(DOLRECOMP_REVISION) + "|dolrecomp-binary=" +
++      dolrecomp_binary_identity.str() + "|patchset=" +
++      std::string(MODULE_PATCHSET_REVISION) + "|module-abi=" +
+       std::to_string(MODERNGEKKO_MODULE_ABI_VERSION) + "|cpu-abi=" +
+       std::to_string(MODERNGEKKO_CPU_ABI_VERSION) + "|" + compiler_identity + "|" +
+       std::string(architecture) + "|" + flags;
+@@ -269,6 +334,8 @@ std::optional<fs::path> Build(const char* argv0, const fs::path& root,
+     manifest << "disc_id=" << game.disc_id << '\n' << "dol_sha256=" << game.dol_sha256 << '\n'
+              << "recompcore_revision=" << RECOMPCORE_REVISION << '\n'
+              << "dolrecomp_revision=" << DOLRECOMP_REVISION << '\n'
++             << "dolrecomp_binary_fnv1a=" << dolrecomp_binary_identity.str() << '\n'
++             << "module_patchset_revision=" << MODULE_PATCHSET_REVISION << '\n'
+              << "module_abi=" << MODERNGEKKO_MODULE_ABI_VERSION << '\n'
+              << "cpu_abi=" << MODERNGEKKO_CPU_ABI_VERSION << '\n'
+              << "compiler=" << compiler_identity << '\n'
+@@ -285,7 +352,6 @@ std::optional<fs::path> Build(const char* argv0, const fs::path& root,
+ 
+   fs::create_directories(artifact);
+   const fs::path generated_parent = artifact / "dolrecomp-output";
+-  const fs::path dolrecomp = SiblingExecutable(argv0, "dolrecomp");
+   std::string generate = Quote(dolrecomp) + " -j" +
+                          std::to_string(std::max(1u, std::thread::hardware_concurrency())) + " ";
+   if (game.platform == moderngekko::GamePlatform::GameCube)
+diff --git a/tools/moderngekko_run.cpp b/tools/moderngekko_run.cpp
+index 75d8ba6..27accc6 100644
+--- a/tools/moderngekko_run.cpp
++++ b/tools/moderngekko_run.cpp
+@@ -8,6 +8,7 @@
+ #include <filesystem>
+ #include <fstream>
+ #include <iostream>
++#include <optional>
+ #include <string>
+ #include <thread>
+ #include <vector>
+@@ -35,7 +36,12 @@ void Usage()
+                " [--game <extracted-root>] [--module <path>]\n"
+                "       [--user-dir <path>] [--title <text>]\n"
+                "       [--graphics <backend>] [--audio <backend>]\n"
++               "       [--cpu-core <static|jit|cached-interpreter|interpreter>]\n"
+                "       [--wayland] [-X11] [--headless] [--allow-interpreter]\n"
++               "       [--trace-video] [--capture-frame <path>]\n"
++               "       [--capture-frame-after <present-count>] [--idle-pc <address>]\n"
++               "       [--trace-gather <path>] [--trace-gather-bursts <count>]\n"
++               "       [--stop-after-ms <milliseconds>]\n"
+                "       With no --game, boots the path in <user-dir>/default-game.txt.\n";
+ }
+ 
+@@ -89,6 +95,7 @@ int main(int argc, char** argv)
+ {
+   moderngekko::RuntimeConfig config;
+   config.user_directory = DefaultUserDirectory();
++  std::optional<std::chrono::milliseconds> stop_after;
+ #ifdef MODERNGEKKO_DEFAULT_WINDOW_TITLE
+   config.window_title = MODERNGEKKO_DEFAULT_WINDOW_TITLE;
+ #endif
+@@ -116,6 +123,23 @@ int main(int argc, char** argv)
+       config.graphics.backend = value("--graphics");
+     else if (arg == "--audio")
+       config.audio.backend = value("--audio");
++    else if (arg == "--cpu-core")
++    {
++      const std::string engine = value("--cpu-core");
++      if (engine == "static")
++        config.cpu_engine = moderngekko::CpuEngine::StaticRecompiler;
++      else if (engine == "jit")
++        config.cpu_engine = moderngekko::CpuEngine::Jit;
++      else if (engine == "cached-interpreter")
++        config.cpu_engine = moderngekko::CpuEngine::CachedInterpreter;
++      else if (engine == "interpreter")
++        config.cpu_engine = moderngekko::CpuEngine::Interpreter;
++      else
++      {
++        std::cerr << "--cpu-core must be static, jit, cached-interpreter, or interpreter\n";
++        return 2;
++      }
++    }
+     else if (arg == "-X11" || arg == "--x11")
+       config.window_system = moderngekko::WindowSystem::X11;
+     else if (arg == "--wayland")
+@@ -124,6 +148,60 @@ int main(int argc, char** argv)
+       config.headless = true;
+     else if (arg == "--allow-interpreter")
+       config.allow_interpreter = true;
++    else if (arg == "--trace-video")
++      config.trace_video = true;
++    else if (arg == "--capture-frame")
++      config.capture_frame = value("--capture-frame");
++    else if (arg == "--capture-frame-after")
++    {
++      const char* text = value("--capture-frame-after");
++      char* end = nullptr;
++      const unsigned long long count = std::strtoull(text, &end, 10);
++      if (!end || *end != '\0' || count == 0)
++      {
++        std::cerr << "--capture-frame-after requires a positive integer\n";
++        return 2;
++      }
++      config.capture_frame_after = count;
++    }
++    else if (arg == "--trace-gather")
++      config.gather_trace = value("--trace-gather");
++    else if (arg == "--trace-gather-bursts")
++    {
++      const char* text = value("--trace-gather-bursts");
++      char* end = nullptr;
++      const unsigned long long count = std::strtoull(text, &end, 10);
++      if (!end || *end != '\0' || count == 0 || count > 1000000)
++      {
++        std::cerr << "--trace-gather-bursts requires an integer from 1 to 1000000\n";
++        return 2;
++      }
++      config.gather_trace_bursts = count;
++    }
++    else if (arg == "--idle-pc")
++    {
++      const char* text = value("--idle-pc");
++      char* end = nullptr;
++      const unsigned long long address = std::strtoull(text, &end, 0);
++      if (!end || *end != '\0' || address > 0xFFFFFFFFull)
++      {
++        std::cerr << "--idle-pc requires a 32-bit address\n";
++        return 2;
++      }
++      config.idle_pc = static_cast<std::uint32_t>(address);
++    }
++    else if (arg == "--stop-after-ms")
++    {
++      const char* text = value("--stop-after-ms");
++      char* end = nullptr;
++      const unsigned long long milliseconds = std::strtoull(text, &end, 10);
++      if (!end || *end != '\0' || milliseconds == 0)
++      {
++        std::cerr << "--stop-after-ms requires a positive integer\n";
++        return 2;
++      }
++      stop_after = std::chrono::milliseconds(milliseconds);
++    }
+     else if (arg == "--help" || arg == "-h")
+     {
+       Usage();
+@@ -155,6 +233,9 @@ int main(int argc, char** argv)
+   }
+   config.graphics.internal_resolution_scale = frontend_config.dolphin_scale;
+   config.show_fps_in_title = frontend_config.show_fps_in_title;
++  config.graphics.show_performance_overlay = frontend_config.show_performance_overlay;
++  config.graphics.enable_graphics_mods = frontend_config.enable_graphics_mods;
++  config.graphics.load_custom_textures = frontend_config.load_custom_textures;
+ 
+   if (!frontend_config.controller.empty())
+   {
+@@ -231,7 +312,29 @@ int main(int argc, char** argv)
+       std::this_thread::sleep_for(std::chrono::milliseconds(50));
+     }
+   });
++  std::jthread timed_stop;
++  if (stop_after)
++  {
++    timed_stop = std::jthread([runtime = created.runtime.get(), duration = *stop_after](
++                                 std::stop_token stop_token) {
++      const auto deadline = std::chrono::steady_clock::now() + duration;
++      while (!stop_token.stop_requested() && std::chrono::steady_clock::now() < deadline)
++        std::this_thread::sleep_for(std::chrono::milliseconds(10));
++      if (stop_token.stop_requested())
++        return;
++      runtime->RequestStop();
++      // The first request attempts a guest-visible graceful shutdown via the STM
++      // power button; RMGE01 rejects it and spins, so escalate to a forced stop
++      // if the runtime is still alive after a short grace period.
++      const auto force_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
++      while (!stop_token.stop_requested() && std::chrono::steady_clock::now() < force_deadline)
++        std::this_thread::sleep_for(std::chrono::milliseconds(50));
++      if (!stop_token.stop_requested())
++        runtime->RequestStop();
++    });
++  }
+   const moderngekko::RuntimeRunResult result = created.runtime->Run();
++  timed_stop.request_stop();
+   signal_watcher.request_stop();
+   if (result.error)
+   {

@@ -1,0 +1,114 @@
+diff --git a/Source/Core/Core/Config/StaticRecompSettings.cpp b/Source/Core/Core/Config/StaticRecompSettings.cpp
+--- a/Source/Core/Core/Config/StaticRecompSettings.cpp
++++ b/Source/Core/Core/Config/StaticRecompSettings.cpp
+@@ -10,6 +10,8 @@ const Info<bool> MAIN_STATICRECOMP_CUSTOM_FRONTEND{
+     {System::Main, "GalaxyPC", "CustomFrontend"}, true};
+ const Info<bool> MAIN_STATICRECOMP_HIDE_FILE_SELECT_ACTORS{
+     {System::Main, "GalaxyPC", "HideFileSelectActors"}, true};
++const Info<bool> MAIN_STATICRECOMP_HYBRID_PERFORMANCE{
++    {System::Main, "GalaxyPC", "HybridPerformance"}, true};
+ const Info<bool> MAIN_STATICRECOMP_INTERPOLATION{
+     {System::Main, "GalaxyPC", "PresentationInterpolation"}, false};
+ const Info<u32> MAIN_STATICRECOMP_INTERPOLATION_RATE{
+diff --git a/Source/Core/Core/Config/StaticRecompSettings.h b/Source/Core/Core/Config/StaticRecompSettings.h
+--- a/Source/Core/Core/Config/StaticRecompSettings.h
++++ b/Source/Core/Core/Config/StaticRecompSettings.h
+@@ -9,6 +9,7 @@ extern const Info<bool> MAIN_STATICRECOMP_MODULE;
+ extern const Info<u32> MAIN_STATICRECOMP_IDLE_PC;
+ extern const Info<bool> MAIN_STATICRECOMP_CUSTOM_FRONTEND;
+ extern const Info<bool> MAIN_STATICRECOMP_HIDE_FILE_SELECT_ACTORS;
++extern const Info<bool> MAIN_STATICRECOMP_HYBRID_PERFORMANCE;
+ extern const Info<bool> MAIN_STATICRECOMP_INTERPOLATION;
+ extern const Info<u32> MAIN_STATICRECOMP_INTERPOLATION_RATE;
+ }  // namespace Config
+diff --git a/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_Run.cpp b/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_Run.cpp
+--- a/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_Run.cpp
++++ b/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_Run.cpp
+@@ -39,5 +39,6 @@ void StaticRecompCore::Run()
+   u64 next_progress_dispatch = 10000000;
+   std::unordered_map<u32, bool> idle_loop_cache;
+   const bool is_rmge01 = m_module && std::strcmp(m_module->game_id, "RMGE01") == 0;
++  bool hybrid_gameplay_logged = false;
+ 
+   const auto is_idle_loop = [&idle_loop_cache](u32 address) {
+@@ -78,8 +79,23 @@ void StaticRecompCore::Run()
+ 
+     do
+     {
++      if (is_rmge01 && FrontendInput::IsFileSelectReleased() &&
++          ppc.pc >= 0x8038F084 && ppc.pc < 0x8038F418)
++      {
++        FrontendInput::Reset();
++      }
++      const bool use_hybrid_gameplay =
++          is_rmge01 && m_jit_fallback &&
++          Config::Get(Config::MAIN_STATICRECOMP_HYBRID_PERFORMANCE) &&
++          FrontendInput::IsFileSelectReleased() && m_file_select_visibility.empty();
++      if (use_hybrid_gameplay && !hybrid_gameplay_logged)
++      {
++        std::fprintf(stderr, "[staticrecomp] hybrid gameplay core active\n");
++        hybrid_gameplay_logged = true;
++      }
++
+       // MSR.FP needs no gate here: generated FPU instructions raise the
+       // FP-unavailable exception themselves (ppc_fp_available).
+-      if (m_module_active && DispatchableAt(ppc.pc))
++      if (m_module_active && !use_hybrid_gameplay && DispatchableAt(ppc.pc))
+       {
+         // Both diagnostics are compile-once conditions on the hot path: skip
+diff --git a/Source/Core/VideoCommon/OnScreenUI.cpp b/Source/Core/VideoCommon/OnScreenUI.cpp
+--- a/Source/Core/VideoCommon/OnScreenUI.cpp
++++ b/Source/Core/VideoCommon/OnScreenUI.cpp
+@@ -1124,6 +1124,15 @@ void OnScreenUI::DrawPerformanceSettings()
+   if (ImGui::Checkbox("Multithreaded graphics backend", &backend_mt))
+     Config::SetBaseOrCurrent(Config::GFX_BACKEND_MULTITHREADING, backend_mt);
+ 
++  bool hybrid = Config::Get(Config::MAIN_STATICRECOMP_HYBRID_PERFORMANCE);
++  if (ImGui::Checkbox("Hybrid performance core after PLAY", &hybrid))
++    Config::SetBaseOrCurrent(Config::MAIN_STATICRECOMP_HYBRID_PERFORMANCE, hybrid);
++  if (ImGui::IsItemHovered())
++  {
++    ImGui::SetTooltip("Keeps the recompiled boot and PC frontend, then uses the optimized CPU "
++                      "core for stable gameplay. Disable this for pure static-recomp testing.");
++  }
++
+   const float simulation_speed = Config::Get(Config::MAIN_EMULATION_SPEED);
+   ImGui::Separator();
+   ImGui::TextUnformatted("Game simulation");
+diff --git a/Source/Core/VideoCommon/Present.cpp b/Source/Core/VideoCommon/Present.cpp
+--- a/Source/Core/VideoCommon/Present.cpp
++++ b/Source/Core/VideoCommon/Present.cpp
+@@ -4,6 +4,7 @@
+ #include "VideoCommon/Present.h"
+ 
+ #include "Common/ChunkFile.h"
++#include "Common/FrontendInput.h"
+ #include "Core/Config/GraphicsSettings.h"
+ #include "Core/Config/MainSettings.h"
+ #include "Core/Config/StaticRecompSettings.h"
+@@ -146,6 +147,14 @@ bool Presenter::Initialize()
+ 
+ bool Presenter::FetchXFB(u32 xfb_addr, u32 fb_width, u32 fb_stride, u32 fb_height, u64 ticks)
+ {
+-  const bool frontend_visible = m_onscreen_ui && m_onscreen_ui->IsSettingsPanelVisible();
++  const bool frontend_visible =
++      (m_onscreen_ui && m_onscreen_ui->IsSettingsPanelVisible()) ||
++      (FrontendInput::IsFileSelectCaptured() && !FrontendInput::IsFileSelectReleased());
++  if (frontend_visible)
++  {
++    m_stable_interpolation_frames = 0;
++    m_pending_interpolated_frames = 0;
++    m_interpolation_final_time_valid = false;
++  }
+   if (Config::Get(Config::MAIN_STATICRECOMP_INTERPOLATION) && !frontend_visible &&
+       !g_ActiveConfig.bVSyncActive && g_ActiveConfig.stereo_mode == StereoMode::Off &&
+@@ -258,6 +268,8 @@ void Presenter::ViSwap(u32 xfb_addr, u32 fb_width, u32 fb_stride, u32 fb_height,
+ 
+   if (!is_duplicate || !g_ActiveConfig.bSkipPresentingDuplicateXFBs)
+   {
+-    const bool frontend_visible = m_onscreen_ui && m_onscreen_ui->IsSettingsPanelVisible();
++    const bool frontend_visible =
++        (m_onscreen_ui && m_onscreen_ui->IsSettingsPanelVisible()) ||
++        (FrontendInput::IsFileSelectCaptured() && !FrontendInput::IsFileSelectReleased());
+     const bool interpolation_requested =
+         Config::Get(Config::MAIN_STATICRECOMP_INTERPOLATION);

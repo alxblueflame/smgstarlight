@@ -1,0 +1,104 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 028d637..584eefe 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -198,6 +198,11 @@ if(MODERNGEKKO_ENABLE_DOLPHIN_RUNTIME)
+         vendor/dolphin/Source/Core/DolphinNoGUI/Platform.cpp
+         vendor/dolphin/Source/Core/DolphinNoGUI/PlatformHeadless.cpp
+     )
++    if(WIN32)
++        target_sources(moderngekko PRIVATE
++            vendor/dolphin/Source/Core/DolphinNoGUI/PlatformWin32.cpp)
++        target_link_libraries(moderngekko PRIVATE dwmapi.lib)
++    endif()
+     if(APPLE)
+         # Dolphin's windowed backend for macOS
+         target_sources(moderngekko PRIVATE
+@@ -331,6 +336,11 @@ if(MODERNGEKKO_ENABLE_DYNAMIC_MODULES)
+     target_compile_definitions(moderngekko PRIVATE MODERNGEKKO_ENABLE_DYNAMIC_MODULES=1)
+ endif()
+ target_compile_features(moderngekko PUBLIC cxx_std_23)
++if(MSVC)
++    target_compile_options(moderngekko PRIVATE /Zc:preprocessor)
++    target_compile_definitions(moderngekko PRIVATE
++        NOMINMAX WIN32_LEAN_AND_MEAN UNICODE _UNICODE)
++endif()
+ if(MODERNGEKKO_ENABLE_DOLPHIN_RUNTIME)
+     target_include_directories(moderngekko PRIVATE
+         "${CMAKE_CURRENT_SOURCE_DIR}/vendor/dolphin/Source/Core")
+@@ -369,6 +379,11 @@ if(MODERNGEKKO_ENABLE_DOLPHIN_RUNTIME)
+         "${CMAKE_CURRENT_SOURCE_DIR}/tools"
+         "${CMAKE_CURRENT_SOURCE_DIR}/vendor/dolphin/Source/Core"
+         "${CMAKE_CURRENT_SOURCE_DIR}/vendor/dolphin/Externals/imgui/imgui/backends")
++    if(MSVC)
++        target_compile_options(moderngekko-launcher PRIVATE /Zc:preprocessor)
++        target_compile_definitions(moderngekko-launcher PRIVATE
++            NOMINMAX WIN32_LEAN_AND_MEAN UNICODE _UNICODE)
++    endif()
+     if(TARGET SDL3-static)
+         set(_moderngekko_sdl_target SDL3-static)
+     elseif(TARGET SDL3::SDL3-shared)
+@@ -394,7 +409,9 @@ if(MODERNGEKKO_ENABLE_DOLPHIN_RUNTIME)
+         target_link_libraries(moderngekko-launcher PRIVATE
+             ModernGekko::Runtime discio imgui ${_moderngekko_sdl_target})
+     endif()
+-    set_target_properties(moderngekko-launcher PROPERTIES OUTPUT_NAME "ModernGekko")
++    set_target_properties(moderngekko-launcher PROPERTIES
++        OUTPUT_NAME "ModernGekko"
++        ARCHIVE_OUTPUT_NAME "ModernGekkoLauncher")
+     if(MODERNGEKKO_FRONTEND_SDK)
+         set_property(TARGET moderngekko-launcher PROPERTY BUILD_RPATH
+             "${_moderngekko_sdk_lib}")
+@@ -409,7 +426,12 @@ if(MODERNGEKKO_ENABLE_DOLPHIN_RUNTIME)
+     target_link_libraries(moderngekko-port PRIVATE ModernGekko::Runtime)
+     target_compile_definitions(moderngekko-port PRIVATE
+         MODERNGEKKO_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
+-    add_dependencies(moderngekko-port dolrecomp moderngekko-run)
++    add_custom_target(moderngekko-copy-dolrecomp
++        COMMAND ${CMAKE_COMMAND} -E copy_if_different
++                "$<TARGET_FILE:dolrecomp>"
++                "$<TARGET_FILE_DIR:moderngekko-port>"
++        DEPENDS dolrecomp)
++    add_dependencies(moderngekko-port moderngekko-copy-dolrecomp moderngekko-run)
+     add_custom_command(TARGET moderngekko-port POST_BUILD
+         COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                 "$<TARGET_FILE:dolrecomp>"
+diff --git a/src/runtime/dolphin_runtime.cpp b/src/runtime/dolphin_runtime.cpp
+index 1c1c890..b35771c 100644
+--- a/src/runtime/dolphin_runtime.cpp
++++ b/src/runtime/dolphin_runtime.cpp
+@@ -175,6 +175,10 @@ RuntimeCreateResult Runtime::Create(RuntimeConfig config)
+ 
+   if (impl->config.headless)
+     impl->platform = Platform::CreateHeadlessPlatform();
++#ifdef _WIN32
++  else
++    impl->platform = Platform::CreateWin32Platform();
++#endif
+ #ifdef MODERNGEKKO_HAVE_COCOA
+   else
+     impl->platform = Platform::CreateMacOSPlatform();
+diff --git a/tools/moderngekko_port.cpp b/tools/moderngekko_port.cpp
+index e9ee76b..ab2b33e 100644
+--- a/tools/moderngekko_port.cpp
++++ b/tools/moderngekko_port.cpp
+@@ -96,7 +96,12 @@ std::string ReadCommand(const std::string& command)
+ bool RunCommand(const std::string& command)
+ {
+   std::cout << "+ " << command << '\n';
++#if defined(_WIN32)
++  const std::string wrapped = '"' + command + '"';
++  return std::system(wrapped.c_str()) == 0;
++#else
+   return std::system(command.c_str()) == 0;
++#endif
+ }
+ 
+ fs::path SiblingExecutable(const char* argv0, std::string name)
+@@ -402,5 +407,5 @@ int main(int argc, char** argv)
+                     Quote(root) + " --module " + Quote(*module);
+   for (const std::string& arg : options.runner_arguments)
+     run += " " + Quote(arg);
+-  return std::system(run.c_str()) == 0 ? 0 : 1;
++  return RunCommand(run) ? 0 : 1;
+ }

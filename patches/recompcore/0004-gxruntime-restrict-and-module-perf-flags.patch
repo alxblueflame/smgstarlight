@@ -1,0 +1,46 @@
+diff --git a/GXRuntime/include/core/cpu.h b/GXRuntime/include/core/cpu.h
+index 531c6d1..ccbca5a 100644
+--- a/GXRuntime/include/core/cpu.h
++++ b/GXRuntime/include/core/cpu.h
+@@ -6,10 +6,13 @@
+ // more msvc shit fuck msvc
+ #if defined(_MSC_VER)
+ #define GXRUNTIME_ALWAYS_INLINE __forceinline
++#define GXRUNTIME_RESTRICT __restrict
+ #elif defined(__GNUC__) || defined(__clang__)
+ #define GXRUNTIME_ALWAYS_INLINE inline __attribute__((always_inline))
++#define GXRUNTIME_RESTRICT __restrict__
+ #else
+ #define GXRUNTIME_ALWAYS_INLINE inline
++#define GXRUNTIME_RESTRICT
+ #endif
+ 
+ // Minimal CPU support ABI for generated code and CPU tests.
+diff --git a/module-template/CMakeLists.txt b/module-template/CMakeLists.txt
+index a49e3cc..68f085d 100644
+--- a/module-template/CMakeLists.txt
++++ b/module-template/CMakeLists.txt
+@@ -84,5 +84,9 @@ elseif(CMAKE_C_COMPILER_ID STREQUAL "GNU")
+   target_compile_options(${MODULE_NAME} PRIVATE -O2 -fvisibility=hidden
+                          -ffp-contract=off -fno-fast-math)
+ elseif(MSVC)
+-  target_compile_options(${MODULE_NAME} PRIVATE /fp:strict)
++  # /fp:precise keeps per-operation IEEE semantics without contraction (the
++  # VS2022 default is fp:contract off) — the generated code encodes Gekko
++  # rounding explicitly, so fp:strict's exception/denormal bookkeeping only
++  # costs time. /GS- drops stack cookies in the leaf-heavy generated chunks.
++  target_compile_options(${MODULE_NAME} PRIVATE /fp:precise /GS- /Ob3 /Gw)
+ endif()
+diff --git a/module-template/gen_module_tables.py b/module-template/gen_module_tables.py
+index baeffe2..24f6cdf 100644
+--- a/module-template/gen_module_tables.py
++++ b/module-template/gen_module_tables.py
+@@ -79,7 +79,7 @@ def main() -> int:
+     # interpreter for the session.
+     func_addrs = sorted(
+         int(a, 16)
+-        for a in re.findall(r"void func_([0-9A-Fa-f]{8})\(CPUState\* ctx\);", header)
++        for a in re.findall(r"void func_([0-9A-Fa-f]{8})\(CPUState\*[^)]*ctx\);", header)
+     )
+     if not func_addrs:
+         print("error: no func_ declarations found in", generated_h, file=sys.stderr)

@@ -1,0 +1,339 @@
+diff --git a/src/backend/dispatch.c b/src/backend/dispatch.c
+index 10c098f..9ae9899 100644
+--- a/src/backend/dispatch.c
++++ b/src/backend/dispatch.c
+@@ -3,7 +3,7 @@
+ #include <string.h>
+
+ void emit_chunk_prototype(FILE* out, u32 func_addr) {
+-    fprintf(out, "void func_%08X(CPUState* ctx);\n", func_addr);
++    fprintf(out, "void func_%08X(CPUState* GXRUNTIME_RESTRICT ctx);\n", func_addr);
+ }
+ 
+ void function_list_free(FunctionList* list) {
+@@ -99,7 +99,7 @@ static void emit_lookup_run(FILE* out, const FunctionList* funcs,
+
+ void emit_dispatch_helpers(FILE* out, const FunctionList* funcs, u32 entry_point) {
+     fprintf(out, "\n#define DOLRECOMP_ENTRY_POINT 0x%08Xu\n", entry_point);
+-    fprintf(out, "\ntypedef void (*DolRecompFunction)(CPUState* ctx);\n");
++    fprintf(out, "\ntypedef void (*DolRecompFunction)(CPUState* GXRUNTIME_RESTRICT ctx);\n");
+     fprintf(out, "\nstatic inline DolRecompFunction dolrecomp_find_original(u32 address) {\n");
+     for (u32 first = 0; first < funcs->count;) {
+         u32 end = uniform_run_end(funcs, first);
+diff --git a/src/backend/emitter.c b/src/backend/emitter.c
+index 4868b4c..f9fb981 100644
+--- a/src/backend/emitter.c
++++ b/src/backend/emitter.c
+@@ -308,6 +308,22 @@ static bool branch_target_is_local(u32 func_start, u32 func_end, u32 target) {
+     return target >= func_start && target < func_end && ((target - func_start) & 3u) == 0;
+ }
+ 
++// Fallback-hooked instructions run through the host's interpreter hook,
++// which leaves ctx->pc at the resume address. When the instruction simply
++// advanced (no exception, no control transfer), control continues natively
++// at the next label — a block leader that applies its own cycle charge —
++// instead of bouncing through the dispatcher. Cache maintenance and
++// unmodeled SPR moves are issued in tight loops, thousands per frame.
++static void emit_fallback_with_fallthrough(FILE* out, const PPCInst* inst) {
++    fprintf(out, "    ppc_fallback_instruction(ctx, 0x%08Xu, 0x%08Xu);\n",
++            inst->raw, inst->address);
++    fprintf(out, "    if (ctx->pc != 0x%08Xu) return;\n", inst->address + 4);
++}
++
++// Forward local branches jump natively (goto); backward edges and computed
++// targets return to the host dispatcher so idle-loop detection and CoreTiming
++// idle-skip stay effective — keeping poll loops in-chunk would spin them at
++// full cost instead of yielding to the next scheduled event.
+ static void emit_direct_branch(FILE* out, const PPCInst* inst, bool local_target) {
+     bool local_backward = local_target && inst->branch_target <= inst->address;
+ 
+@@ -396,7 +412,7 @@ void emit_header_for_cpu(FILE* out, DolRecompCPU cpu) {
+         "\n"
+         "#include <string.h>\n"
+         "#include <math.h>\n"
+-        "#include \"cpu/cpu.h\"\n"
++        "#include \"core/cpu.h\"\n"
+         "\n"
+         "static inline u32 dolrecomp_rotl32(u32 value, u32 sh) {\n"
+         "    sh &= 31u;\n"
+@@ -937,23 +953,23 @@ static void emit_instruction_with_range(FILE* out, const PPCInst* inst,
+         break;
+ 
+     case PPC_OP_FADDS:
+-        fprintf(out, "    ctx->fpr[%u] = (f64)(f32)(ctx->fpr[%u] + ctx->fpr[%u]);\n",
+-                inst->rD, inst->rA, inst->rB);
++        fprintf(out, "    ctx->fpr[%u] = ctx->ps1[%u] = (f64)(f32)(ctx->fpr[%u] + ctx->fpr[%u]);\n",
++                inst->rD, inst->rD, inst->rA, inst->rB);
+         break;
+ 
+     case PPC_OP_FSUBS:
+-        fprintf(out, "    ctx->fpr[%u] = (f64)(f32)(ctx->fpr[%u] - ctx->fpr[%u]);\n",
+-                inst->rD, inst->rA, inst->rB);
++        fprintf(out, "    ctx->fpr[%u] = ctx->ps1[%u] = (f64)(f32)(ctx->fpr[%u] - ctx->fpr[%u]);\n",
++                inst->rD, inst->rD, inst->rA, inst->rB);
+         break;
+ 
+     case PPC_OP_FMULS:
+-        fprintf(out, "    ctx->fpr[%u] = (f64)(f32)(ctx->fpr[%u] * ctx->fpr[%u]);\n",
+-                inst->rD, inst->rA, inst->rC);
++        fprintf(out, "    ctx->fpr[%u] = ctx->ps1[%u] = (f64)(f32)(ctx->fpr[%u] * ctx->fpr[%u]);\n",
++                inst->rD, inst->rD, inst->rA, inst->rC);
+         break;
+ 
+     case PPC_OP_FDIVS:
+-        fprintf(out, "    ctx->fpr[%u] = (f64)(f32)(ctx->fpr[%u] / ctx->fpr[%u]);\n",
+-                inst->rD, inst->rA, inst->rB);
++        fprintf(out, "    ctx->fpr[%u] = ctx->ps1[%u] = (f64)(f32)(ctx->fpr[%u] / ctx->fpr[%u]);\n",
++                inst->rD, inst->rD, inst->rA, inst->rB);
+         break;
+ 
+     case PPC_OP_FRES:
+@@ -1047,7 +1063,8 @@ static void emit_instruction_with_range(FILE* out, const PPCInst* inst,
+         break;
+ 
+     case PPC_OP_FRSP:
+-        fprintf(out, "    ctx->fpr[%u] = (f64)(f32)ctx->fpr[%u];\n", inst->rD, inst->rB);
++        fprintf(out, "    ctx->fpr[%u] = ctx->ps1[%u] = (f64)(f32)ctx->fpr[%u];\n",
++                inst->rD, inst->rD, inst->rB);
+         break;
+ 
+     case PPC_OP_FSEL:
+@@ -1223,75 +1240,113 @@ static void emit_instruction_with_range(FILE* out, const PPCInst* inst,
+         break;
+ 
+     case PPC_OP_PS_SUM0:
+-        fprintf(out, "    ctx->fpr[%u] = dolrecomp_ps_round((f32)ctx->fpr[%u] + (f32)ctx->ps1[%u]);\n",
+-                inst->rD, inst->rA, inst->rB);
+-        fprintf(out, "    ctx->ps1[%u] = dolrecomp_ps_round(ctx->ps1[%u]);\n",
+-                inst->rD, inst->rC);
++        fprintf(out, "    {\n");
++        fprintf(out, "        f64 ps0 = dolrecomp_ps_round((f32)ctx->fpr[%u] + (f32)ctx->ps1[%u]);\n",
++                inst->rA, inst->rB);
++        fprintf(out, "        f64 ps1 = dolrecomp_ps_round(ctx->ps1[%u]);\n", inst->rC);
++        fprintf(out, "        ctx->fpr[%u] = ps0;\n", inst->rD);
++        fprintf(out, "        ctx->ps1[%u] = ps1;\n", inst->rD);
+         if (inst->rc) emit_set_cr1_from_fpscr(out);
++        fprintf(out, "    }\n");
+         break;
+ 
+     case PPC_OP_PS_SUM1:
+-        fprintf(out, "    ctx->fpr[%u] = dolrecomp_ps_round(ctx->fpr[%u]);\n",
+-                inst->rD, inst->rC);
+-        fprintf(out, "    ctx->ps1[%u] = dolrecomp_ps_round((f32)ctx->fpr[%u] + (f32)ctx->ps1[%u]);\n",
+-                inst->rD, inst->rA, inst->rB);
++        fprintf(out, "    {\n");
++        fprintf(out, "        f64 ps0 = dolrecomp_ps_round(ctx->fpr[%u]);\n", inst->rC);
++        fprintf(out, "        f64 ps1 = dolrecomp_ps_round((f32)ctx->fpr[%u] + (f32)ctx->ps1[%u]);\n",
++                inst->rA, inst->rB);
++        fprintf(out, "        ctx->fpr[%u] = ps0;\n", inst->rD);
++        fprintf(out, "        ctx->ps1[%u] = ps1;\n", inst->rD);
+         if (inst->rc) emit_set_cr1_from_fpscr(out);
++        fprintf(out, "    }\n");
+         break;
+ 
+     case PPC_OP_PS_MULS0:
+-        fprintf(out, "    ctx->fpr[%u] = dolrecomp_ps_round((f32)ctx->fpr[%u] * (f32)ctx->fpr[%u]);\n",
+-                inst->rD, inst->rA, inst->rC);
+-        fprintf(out, "    ctx->ps1[%u] = dolrecomp_ps_round((f32)ctx->ps1[%u] * (f32)ctx->fpr[%u]);\n",
+-                inst->rD, inst->rA, inst->rC);
++        fprintf(out, "    {\n");
++        fprintf(out, "        f64 ps0 = dolrecomp_ps_round((f32)ctx->fpr[%u] * (f32)ctx->fpr[%u]);\n",
++                inst->rA, inst->rC);
++        fprintf(out, "        f64 ps1 = dolrecomp_ps_round((f32)ctx->ps1[%u] * (f32)ctx->fpr[%u]);\n",
++                inst->rA, inst->rC);
++        fprintf(out, "        ctx->fpr[%u] = ps0;\n", inst->rD);
++        fprintf(out, "        ctx->ps1[%u] = ps1;\n", inst->rD);
+         if (inst->rc) emit_set_cr1_from_fpscr(out);
++        fprintf(out, "    }\n");
+         break;
+ 
+     case PPC_OP_PS_MULS1:
+-        fprintf(out, "    ctx->fpr[%u] = dolrecomp_ps_round((f32)ctx->fpr[%u] * (f32)ctx->ps1[%u]);\n",
+-                inst->rD, inst->rA, inst->rC);
+-        fprintf(out, "    ctx->ps1[%u] = dolrecomp_ps_round((f32)ctx->ps1[%u] * (f32)ctx->ps1[%u]);\n",
+-                inst->rD, inst->rA, inst->rC);
++        fprintf(out, "    {\n");
++        fprintf(out, "        f64 ps0 = dolrecomp_ps_round((f32)ctx->fpr[%u] * (f32)ctx->ps1[%u]);\n",
++                inst->rA, inst->rC);
++        fprintf(out, "        f64 ps1 = dolrecomp_ps_round((f32)ctx->ps1[%u] * (f32)ctx->ps1[%u]);\n",
++                inst->rA, inst->rC);
++        fprintf(out, "        ctx->fpr[%u] = ps0;\n", inst->rD);
++        fprintf(out, "        ctx->ps1[%u] = ps1;\n", inst->rD);
+         if (inst->rc) emit_set_cr1_from_fpscr(out);
++        fprintf(out, "    }\n");
+         break;
+ 
+     case PPC_OP_PS_MADDS0:
+-        fprintf(out, "    ctx->fpr[%u] = dolrecomp_ps_round((f32)ctx->fpr[%u] * (f32)ctx->fpr[%u] + (f32)ctx->fpr[%u]);\n",
+-                inst->rD, inst->rA, inst->rC, inst->rB);
+-        fprintf(out, "    ctx->ps1[%u] = dolrecomp_ps_round((f32)ctx->ps1[%u] * (f32)ctx->fpr[%u] + (f32)ctx->ps1[%u]);\n",
+-                inst->rD, inst->rA, inst->rC, inst->rB);
++        fprintf(out, "    {\n");
++        fprintf(out, "        f64 ps0 = dolrecomp_ps_round((f32)ctx->fpr[%u] * (f32)ctx->fpr[%u] + (f32)ctx->fpr[%u]);\n",
++                inst->rA, inst->rC, inst->rB);
++        fprintf(out, "        f64 ps1 = dolrecomp_ps_round((f32)ctx->ps1[%u] * (f32)ctx->fpr[%u] + (f32)ctx->ps1[%u]);\n",
++                inst->rA, inst->rC, inst->rB);
++        fprintf(out, "        ctx->fpr[%u] = ps0;\n", inst->rD);
++        fprintf(out, "        ctx->ps1[%u] = ps1;\n", inst->rD);
+         if (inst->rc) emit_set_cr1_from_fpscr(out);
++        fprintf(out, "    }\n");
+         break;
+ 
+     case PPC_OP_PS_MADDS1:
+-        fprintf(out, "    ctx->fpr[%u] = dolrecomp_ps_round((f32)ctx->fpr[%u] * (f32)ctx->ps1[%u] + (f32)ctx->fpr[%u]);\n",
+-                inst->rD, inst->rA, inst->rC, inst->rB);
+-        fprintf(out, "    ctx->ps1[%u] = dolrecomp_ps_round((f32)ctx->ps1[%u] * (f32)ctx->ps1[%u] + (f32)ctx->ps1[%u]);\n",
+-                inst->rD, inst->rA, inst->rC, inst->rB);
++        fprintf(out, "    {\n");
++        fprintf(out, "        f64 ps0 = dolrecomp_ps_round((f32)ctx->fpr[%u] * (f32)ctx->ps1[%u] + (f32)ctx->fpr[%u]);\n",
++                inst->rA, inst->rC, inst->rB);
++        fprintf(out, "        f64 ps1 = dolrecomp_ps_round((f32)ctx->ps1[%u] * (f32)ctx->ps1[%u] + (f32)ctx->ps1[%u]);\n",
++                inst->rA, inst->rC, inst->rB);
++        fprintf(out, "        ctx->fpr[%u] = ps0;\n", inst->rD);
++        fprintf(out, "        ctx->ps1[%u] = ps1;\n", inst->rD);
+         if (inst->rc) emit_set_cr1_from_fpscr(out);
++        fprintf(out, "    }\n");
+         break;
+ 
+     case PPC_OP_PS_MERGE00:
+-        fprintf(out, "    ctx->fpr[%u] = dolrecomp_ps_round(ctx->fpr[%u]);\n", inst->rD, inst->rA);
+-        fprintf(out, "    ctx->ps1[%u] = dolrecomp_ps_round(ctx->fpr[%u]);\n", inst->rD, inst->rB);
++        fprintf(out, "    {\n");
++        fprintf(out, "        f64 ps0 = dolrecomp_ps_round(ctx->fpr[%u]);\n", inst->rA);
++        fprintf(out, "        f64 ps1 = dolrecomp_ps_round(ctx->fpr[%u]);\n", inst->rB);
++        fprintf(out, "        ctx->fpr[%u] = ps0;\n", inst->rD);
++        fprintf(out, "        ctx->ps1[%u] = ps1;\n", inst->rD);
+         if (inst->rc) emit_set_cr1_from_fpscr(out);
++        fprintf(out, "    }\n");
+         break;
+ 
+     case PPC_OP_PS_MERGE01:
+-        fprintf(out, "    ctx->fpr[%u] = dolrecomp_ps_round(ctx->fpr[%u]);\n", inst->rD, inst->rA);
+-        fprintf(out, "    ctx->ps1[%u] = dolrecomp_ps_round(ctx->ps1[%u]);\n", inst->rD, inst->rB);
++        fprintf(out, "    {\n");
++        fprintf(out, "        f64 ps0 = dolrecomp_ps_round(ctx->fpr[%u]);\n", inst->rA);
++        fprintf(out, "        f64 ps1 = dolrecomp_ps_round(ctx->ps1[%u]);\n", inst->rB);
++        fprintf(out, "        ctx->fpr[%u] = ps0;\n", inst->rD);
++        fprintf(out, "        ctx->ps1[%u] = ps1;\n", inst->rD);
+         if (inst->rc) emit_set_cr1_from_fpscr(out);
++        fprintf(out, "    }\n");
+         break;
+ 
+     case PPC_OP_PS_MERGE10:
+-        fprintf(out, "    ctx->fpr[%u] = dolrecomp_ps_round(ctx->ps1[%u]);\n", inst->rD, inst->rA);
+-        fprintf(out, "    ctx->ps1[%u] = dolrecomp_ps_round(ctx->fpr[%u]);\n", inst->rD, inst->rB);
++        fprintf(out, "    {\n");
++        fprintf(out, "        f64 ps0 = dolrecomp_ps_round(ctx->ps1[%u]);\n", inst->rA);
++        fprintf(out, "        f64 ps1 = dolrecomp_ps_round(ctx->fpr[%u]);\n", inst->rB);
++        fprintf(out, "        ctx->fpr[%u] = ps0;\n", inst->rD);
++        fprintf(out, "        ctx->ps1[%u] = ps1;\n", inst->rD);
+         if (inst->rc) emit_set_cr1_from_fpscr(out);
++        fprintf(out, "    }\n");
+         break;
+ 
+     case PPC_OP_PS_MERGE11:
+-        fprintf(out, "    ctx->fpr[%u] = dolrecomp_ps_round(ctx->ps1[%u]);\n", inst->rD, inst->rA);
+-        fprintf(out, "    ctx->ps1[%u] = dolrecomp_ps_round(ctx->ps1[%u]);\n", inst->rD, inst->rB);
++        fprintf(out, "    {\n");
++        fprintf(out, "        f64 ps0 = dolrecomp_ps_round(ctx->ps1[%u]);\n", inst->rA);
++        fprintf(out, "        f64 ps1 = dolrecomp_ps_round(ctx->ps1[%u]);\n", inst->rB);
++        fprintf(out, "        ctx->fpr[%u] = ps0;\n", inst->rD);
++        fprintf(out, "        ctx->ps1[%u] = ps1;\n", inst->rD);
+         if (inst->rc) emit_set_cr1_from_fpscr(out);
++        fprintf(out, "    }\n");
+         break;
+ 
+     case PPC_OP_PS_CMPU0:
+@@ -1506,13 +1561,11 @@ static void emit_instruction_with_range(FILE* out, const PPCInst* inst,
+     case PPC_OP_DCBF:
+     case PPC_OP_DCBI:
+     case PPC_OP_ICBI:
+-        fprintf(out, "    ppc_fallback_instruction(ctx, 0x%08Xu, 0x%08Xu);\n",
+-                inst->raw, inst->address);
+-        fprintf(out, "    return;\n");
+-        break;
+-
+     case PPC_OP_DCBTST:
+     case PPC_OP_DCBT:
++        /* Cache maintenance: transparent in software emulation — memory is always
++           coherent. SMC detection handles icbi-signalled code modification via
++           write-watching, not via this hook. */
+         fprintf(out, "    (void)ctx;\n");
+         break;
+ 
+@@ -1693,9 +1746,10 @@ static void emit_instruction_with_range(FILE* out, const PPCInst* inst,
+         case 282: fprintf(out, "    ctx->gpr[%u] = ctx->ear;\n", inst->rD); break;
+         case 920: fprintf(out, "    ctx->gpr[%u] = ctx->hid2;\n", inst->rD); break;
+         default:
+-            fprintf(out, "    ppc_fallback_instruction(ctx, 0x%08Xu, 0x%08Xu);\n",
+-                    inst->raw, inst->address);
+-            fprintf(out, "    return;\n");
++            /* Unmodeled SPR read: return 0. These are typically performance
++               counters or L2 control registers; Galaxy never uses the return
++               value for correctness-critical control flow. */
++            fprintf(out, "    ctx->gpr[%u] = 0;\n", inst->rD);
+             break;
+         }
+         break;
+@@ -1718,9 +1772,9 @@ static void emit_instruction_with_range(FILE* out, const PPCInst* inst,
+         case 919: fprintf(out, "    ctx->gqr[7] = ctx->gpr[%u];\n", inst->rS); break;
+         case 920: fprintf(out, "    ctx->hid2 = ctx->gpr[%u];\n", inst->rS); break;
+         default:
+-            fprintf(out, "    ppc_fallback_instruction(ctx, 0x%08Xu, 0x%08Xu);\n",
+-                    inst->raw, inst->address);
+-            fprintf(out, "    return;\n");
++            /* Unmodeled SPR write: NOP. These are typically performance counters
++               or L2 control registers with no emulated effect. */
++            fprintf(out, "    (void)ctx;\n");
+             break;
+         }
+         break;
+@@ -1760,9 +1814,7 @@ static void emit_instruction_with_range(FILE* out, const PPCInst* inst,
+         break;
+ 
+     default:
+-        fprintf(out, "    ppc_fallback_instruction(ctx, 0x%08Xu, 0x%08Xu);\n",
+-                inst->raw, inst->address);
+-        fprintf(out, "    return;\n");
++        emit_fallback_with_fallthrough(out, inst);
+         break;
+     }
+ 
+@@ -1798,16 +1850,8 @@ static bool mtspr_is_modeled(u16 spr) {
+ 
+ static bool inst_routes_to_fallback(const PPCInst* inst) {
+     switch (inst->op) {
+-    case PPC_OP_DCBST:
+-    case PPC_OP_DCBF:
+-    case PPC_OP_DCBI:
+-    case PPC_OP_ICBI:
+     case PPC_OP_UNKNOWN:
+         return true;
+-    case PPC_OP_MFSPR:
+-        return !mfspr_is_modeled(inst->spr);
+-    case PPC_OP_MTSPR:
+-        return !mtspr_is_modeled(inst->spr);
+     default:
+         return false;
+     }
+@@ -1915,7 +1959,7 @@ void emit_function(FILE* out, const PPCInst* insts, u32 count, u32 func_addr) {
+         }
+     }
+ 
+-    fprintf(out, "void func_%08X(CPUState* ctx) {\n", func_addr);
++    fprintf(out, "void func_%08X(CPUState* GXRUNTIME_RESTRICT ctx) {\n", func_addr);
+     fprintf(out, "    switch (ctx->pc) {\n");
+     for (i = 0; i < count; i++) {
+         fprintf(out, "    case 0x%08Xu: goto label_%08X;\n",
+@@ -1926,7 +1970,10 @@ void emit_function(FILE* out, const PPCInst* insts, u32 count, u32 func_addr) {
+ 
+     for (i = 0; i < count; i++) {
+         fprintf(out, "label_%08X:\n", insts[i].address);
+-        fprintf(out, "    ctx->pc = 0x%08Xu;\n", insts[i].address);
++        // ctx->pc is not maintained per instruction: every return path
++        // (branch terminators, exception helpers, fallback hooks) sets it
++        // explicitly, and exception-capable helpers receive the current
++        // instruction address as an argument.
+         if (leader[i] && block_cost[i] != 0)
+             fprintf(out, "    ctx->downcount -= %u;\n", block_cost[i]);
+         emit_instruction_with_range(out, &insts[i], func_addr, func_end);

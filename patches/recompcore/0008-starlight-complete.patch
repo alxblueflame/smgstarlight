@@ -1,0 +1,3916 @@
+diff --git a/GXRuntime/include/core/cpu.h b/GXRuntime/include/core/cpu.h
+index 531c6d1..e7791fe 100644
+--- a/GXRuntime/include/core/cpu.h
++++ b/GXRuntime/include/core/cpu.h
+@@ -3,13 +3,15 @@
+ #define DOLRECOMP_CPU_H
+ 
+ #include "types.h"
+-// more msvc shit fuck msvc
+ #if defined(_MSC_VER)
+ #define GXRUNTIME_ALWAYS_INLINE __forceinline
++#define GXRUNTIME_RESTRICT __restrict
+ #elif defined(__GNUC__) || defined(__clang__)
+ #define GXRUNTIME_ALWAYS_INLINE inline __attribute__((always_inline))
++#define GXRUNTIME_RESTRICT __restrict__
+ #else
+ #define GXRUNTIME_ALWAYS_INLINE inline
++#define GXRUNTIME_RESTRICT
+ #endif
+ 
+ // Minimal CPU support ABI for generated code and CPU tests.
+@@ -27,7 +29,8 @@
+ //   consumes and resets it (Dolphin chassis: per-dispatch flush into
+ //   ppc_state.downcount). Hosts that do not meter guest time may ignore it
+ //   (s64: it cannot wrap in any realistic session).
+-#define GXRUNTIME_CPU_ABI_VERSION 2u
++// - ABI v3 adds `dispatch_budget` for timing-bounded native call and loop linking.
++#define GXRUNTIME_CPU_ABI_VERSION 3u
+ #define GXRUNTIME_CPU_ABI_DOLRECOMP_PREFIX 1u
+ #define GXRUNTIME_CPU_ABI_EXTERNAL_POINTER_EXTENSION 1u
+ 
+@@ -142,6 +145,7 @@ struct CPUState {
+     s64 downcount;
+     u8* exram;
+     u32 exram_size;
++    s64 dispatch_budget;
+ };
+ 
+ #include <stdio.h>
+@@ -152,23 +156,21 @@ extern void* g_mem_write_journal_user;
+ 
+ static GXRUNTIME_ALWAYS_INLINE u8* get_ram_ptr(CPUState* cpu, u32 addr, u32 size, u32* out_offset) {
+     u32 masked_addr = addr & ~0x40000000u;
+-    
+-    // Check MEM2 (EXRAM) first as it is much more common in Wii titles
+-    if (cpu->exram) {
++
++    if ((masked_addr & 0xF0000000u) == 0x80000000u) {
++        u32 offset = masked_addr - 0x80000000u;
++        if (offset <= cpu->ram_size - size) {
++            if (out_offset) *out_offset = offset;
++            return cpu->ram + offset;
++        }
++    } else if ((masked_addr & 0xF0000000u) == 0x90000000u && cpu->exram) {
+         u32 offset = masked_addr - 0x90000000u;
+         if (offset <= cpu->exram_size - size) {
+             if (out_offset) *out_offset = (u32)-1;
+             return cpu->exram + offset;
+         }
+     }
+-    
+-    // Check MEM1
+-    u32 offset = masked_addr - 0x80000000u;
+-    if (offset <= cpu->ram_size - size) {
+-        if (out_offset) *out_offset = offset;
+-        return cpu->ram + offset;
+-    }
+-    
++
+     return NULL;
+ }
+ 
+diff --git a/GXRuntime/src/core/cpu.c b/GXRuntime/src/core/cpu.c
+index 0bf0bc0..8b792e9 100644
+--- a/GXRuntime/src/core/cpu.c
++++ b/GXRuntime/src/core/cpu.c
+@@ -24,7 +24,12 @@
+  * offset (into cpu->ram) about to be written, `size` the width in bytes. */
+ PPCMemWriteJournal g_mem_write_journal = NULL;
+ void* g_mem_write_journal_user = NULL;
+-__attribute__((visibility("default"))) void ppc_set_mem_write_journal(PPCMemWriteJournal fn, void* user) {
++#if defined(_MSC_VER)
++#define GXRUNTIME_EXPORT __declspec(dllexport)
++#else
++#define GXRUNTIME_EXPORT __attribute__((visibility("default")))
++#endif
++GXRUNTIME_EXPORT void ppc_set_mem_write_journal(PPCMemWriteJournal fn, void* user) {
+     g_mem_write_journal = fn;
+     g_mem_write_journal_user = user;
+ }
+@@ -175,6 +180,94 @@ u32 ppc_mftb(CPUState* cpu, u16 tbr, u32 cia) {
+     ppc_program_exception(cpu, PPC_PROGRAM_ILLEGAL, cia);
+     return 0;
+ }
++
++static u32 ppc_spr_field(u16 spr) {
++    return ((u32)(spr & 0x1Fu) << 16) | ((u32)(spr & 0x3E0u) << 6);
++}
++
++u32 ppc_mfspr(CPUState* cpu, u16 spr, u32 cia) {
++    switch (spr) {
++    case 1: return cpu->xer;
++    case 8: return cpu->lr;
++    case 9: return cpu->ctr;
++    case 18: return cpu->dsisr;
++    case 19: return cpu->dar;
++    case 26: return cpu->srr0;
++    case 27: return cpu->srr1;
++    case 282: return cpu->ear;
++    case 912:
++    case 913:
++    case 914:
++    case 915:
++    case 916:
++    case 917:
++    case 918:
++    case 919:
++        return cpu->gqr[spr - 912];
++    case 920:
++        return cpu->hid2;
++    default:
++        break;
++    }
++
++    if (!cpu->instruction_fallback) {
++        ppc_program_exception(cpu, PPC_PROGRAM_ILLEGAL, cia);
++        return 0;
++    }
++
++    u32 saved_r0 = cpu->gpr[0];
++    u32 raw = (31u << 26) | ppc_spr_field(spr) | (339u << 1);
++    ppc_fallback_instruction(cpu, raw, cia);
++    u32 value = cpu->gpr[0];
++    cpu->gpr[0] = saved_r0;
++    return value;
++}
++
++void ppc_mtspr(CPUState* cpu, u16 spr, u32 value, u32 cia) {
++    switch (spr) {
++    case 1: cpu->xer = value; return;
++    case 8: cpu->lr = value; return;
++    case 9: cpu->ctr = value; return;
++    case 18: cpu->dsisr = value; return;
++    case 19: cpu->dar = value; return;
++    case 26: cpu->srr0 = value; return;
++    case 27: cpu->srr1 = value; return;
++    case 282: cpu->ear = value; return;
++    case 284:
++        cpu->timebase = (cpu->timebase & 0xFFFFFFFF00000000ull) | value;
++        return;
++    case 285:
++        cpu->timebase = ((u64)value << 32) | (cpu->timebase & 0xFFFFFFFFull);
++        return;
++    case 912:
++    case 913:
++    case 914:
++    case 915:
++    case 916:
++    case 917:
++    case 918:
++    case 919:
++        cpu->gqr[spr - 912] = value;
++        return;
++    case 920:
++        cpu->hid2 = value;
++        return;
++    default:
++        break;
++    }
++
++    if (!cpu->instruction_fallback) {
++        ppc_program_exception(cpu, PPC_PROGRAM_ILLEGAL, cia);
++        return;
++    }
++
++    u32 saved_r0 = cpu->gpr[0];
++    u32 raw = (31u << 26) | ppc_spr_field(spr) | (467u << 1);
++    cpu->gpr[0] = value;
++    ppc_fallback_instruction(cpu, raw, cia);
++    cpu->gpr[0] = saved_r0;
++}
++
+ static s32 gqr_scale(u32 value) {
+     return sign_extend(value & 0x3Fu, 6);
+ }
+@@ -338,8 +431,16 @@ void ppc_dcbz_l(CPUState* cpu, u32 ea, u32 cia) {
+         cpu->locked_cache_tag[slot] = block;
+     }
+ 
+-    for (u32 i = 0; i < 32; i += 4)
+-        mem_write32(cpu, block + i, 0);
++    u32 offset;
++    u8* ptr = get_ram_ptr(cpu, block, 32, &offset);
++    if (ptr != NULL) {
++        if (offset != (u32)-1 && g_mem_write_journal)
++            g_mem_write_journal(offset, 32, g_mem_write_journal_user);
++        memset(ptr, 0, 32);
++    } else {
++        for (u32 i = 0; i < 32; i += 4)
++            mem_write32(cpu, block + i, 0);
++    }
+ }
+ 
+ u32 ppc_eciwx(CPUState* cpu, u32 ea, u32 cia) {
+diff --git a/GXRuntime/tests/runtime_tests.c b/GXRuntime/tests/runtime_tests.c
+index 55606fb..6845226 100644
+--- a/GXRuntime/tests/runtime_tests.c
++++ b/GXRuntime/tests/runtime_tests.c
+@@ -27,7 +27,7 @@
+ #include <stdio.h>
+ #include <string.h>
+ 
+-_Static_assert(GXRUNTIME_CPU_ABI_VERSION == 2u,
++_Static_assert(GXRUNTIME_CPU_ABI_VERSION == 3u,
+                "update runtime ABI tests when the CPU ABI changes");
+ _Static_assert(GXRUNTIME_CPU_ABI_DOLRECOMP_PREFIX == 1u,
+                "GXRuntime generated-code prefix must stay explicit");
+diff --git a/Source/Core/Common/FrontendInput.h b/Source/Core/Common/FrontendInput.h
+new file mode 100644
+index 0000000..8e2c219
+--- /dev/null
++++ b/Source/Core/Common/FrontendInput.h
+@@ -0,0 +1,134 @@
++#pragma once
++
++#include <atomic>
++
++#include "Common/CommonTypes.h"
++
++namespace FrontendInput
++{
++inline std::atomic<u16> s_buttons{0};
++inline std::atomic<bool> s_title_observed{false};
++inline std::atomic<bool> s_title_confirmed{false};
++inline std::atomic<bool> s_file_select_captured{false};
++inline std::atomic<bool> s_file_select_ready{false};
++inline std::atomic<bool> s_file_select_released{false};
++inline std::atomic<bool> s_file_select_input_blocked{false};
++inline std::atomic<int> s_rumble_ticks{-1};
++
++inline void Reset()
++{
++  s_buttons.store(0, std::memory_order_release);
++  s_title_observed.store(false, std::memory_order_release);
++  s_title_confirmed.store(false, std::memory_order_release);
++  s_file_select_captured.store(false, std::memory_order_release);
++  s_file_select_ready.store(false, std::memory_order_release);
++  s_file_select_released.store(false, std::memory_order_release);
++  s_file_select_input_blocked.store(false, std::memory_order_release);
++  s_rumble_ticks.store(-1, std::memory_order_release);
++}
++
++inline void PublishButtons(u16 buttons)
++{
++  s_buttons.store(buttons, std::memory_order_release);
++  if (buttons == 0 && s_file_select_released.load(std::memory_order_acquire))
++    s_file_select_input_blocked.store(false, std::memory_order_release);
++}
++
++inline u16 GetButtons()
++{
++  return s_buttons.load(std::memory_order_acquire);
++}
++
++inline void ObserveGuestPc(u32 pc)
++{
++  if ((pc >= 0x8038F084 && pc < 0x8038F418) ||
++      (pc >= 0x8017C7B4 && pc < 0x8017C874))
++    s_title_observed.store(true, std::memory_order_release);
++
++  if (s_title_observed.load(std::memory_order_acquire) && pc >= 0x8017C874 &&
++      pc < 0x8017D0A0 &&
++      !s_file_select_released.load(std::memory_order_acquire))
++  {
++    s_file_select_captured.store(true, std::memory_order_release);
++    s_file_select_input_blocked.store(true, std::memory_order_release);
++  }
++}
++
++inline bool IsFileSelectCaptured()
++{
++  return s_file_select_captured.load(std::memory_order_acquire);
++}
++
++inline bool HasObservedTitle()
++{
++  return s_title_observed.load(std::memory_order_acquire);
++}
++
++inline void ConfirmTitle()
++{
++  s_title_confirmed.store(true, std::memory_order_release);
++}
++
++inline bool IsTitleConfirmed()
++{
++  return s_title_confirmed.load(std::memory_order_acquire);
++}
++
++inline bool IsFileSelectReady()
++{
++  return s_file_select_ready.load(std::memory_order_acquire);
++}
++
++inline bool IsFileSelectReleased()
++{
++  return s_file_select_released.load(std::memory_order_acquire);
++}
++
++inline bool IsFileSelectInputBlocked()
++{
++  return s_file_select_input_blocked.load(std::memory_order_acquire);
++}
++
++inline void CaptureFileSelect()
++{
++  if (!s_file_select_released.load(std::memory_order_acquire))
++  {
++    s_file_select_captured.store(true, std::memory_order_release);
++    s_file_select_input_blocked.store(true, std::memory_order_release);
++  }
++}
++
++inline void MarkFileSelectReady()
++{
++  if (s_file_select_captured.load(std::memory_order_acquire))
++    s_file_select_ready.store(true, std::memory_order_release);
++}
++
++inline void ReleaseFileSelect()
++{
++  s_file_select_ready.store(false, std::memory_order_release);
++  s_file_select_released.store(true, std::memory_order_release);
++  s_file_select_captured.store(false, std::memory_order_release);
++}
++
++inline void RequestRumble(int ticks)
++{
++  s_rumble_ticks.store(ticks, std::memory_order_release);
++}
++
++inline int ConsumeRumbleState()
++{
++  int ticks = s_rumble_ticks.load(std::memory_order_acquire);
++  while (ticks > 0)
++  {
++    if (s_rumble_ticks.compare_exchange_weak(ticks, ticks - 1, std::memory_order_acq_rel))
++      return 1;
++  }
++  if (ticks == 0 && s_rumble_ticks.compare_exchange_strong(
++                        ticks, -1, std::memory_order_acq_rel))
++  {
++    return 0;
++  }
++  return -1;
++}
++}
+diff --git a/Source/Core/Common/StringUtil.h b/Source/Core/Common/StringUtil.h
+index 0cc4e6c..4c132b0 100644
+--- a/Source/Core/Common/StringUtil.h
++++ b/Source/Core/Common/StringUtil.h
+@@ -256,12 +256,12 @@ inline std::wstring UTF8ToTStr(std::string_view str)
+ #else
+ inline std::string TStrToUTF8(std::string_view str)
+ {
+-  return str;
++  return std::string(str);
+ }
+ 
+ inline std::string UTF8ToTStr(std::string_view str)
+ {
+-  return str;
++  return std::string(str);
+ }
+ #endif
+ 
+diff --git a/Source/Core/Core/Config/StaticRecompSettings.cpp b/Source/Core/Core/Config/StaticRecompSettings.cpp
+index dc62ab8..3ffa365 100644
+--- a/Source/Core/Core/Config/StaticRecompSettings.cpp
++++ b/Source/Core/Core/Config/StaticRecompSettings.cpp
+@@ -6,4 +6,30 @@ namespace Config
+ {
+ const Info<bool> MAIN_STATICRECOMP_MODULE{{System::Main, "Core", "StaticRecompModule"}, true};
+ const Info<u32> MAIN_STATICRECOMP_IDLE_PC{{System::Main, "Core", "StaticRecompIdlePC"}, 0};
++const Info<bool> MAIN_STATICRECOMP_CUSTOM_FRONTEND{
++    {System::Main, "GalaxyPC", "CustomFrontend"}, true};
++const Info<bool> MAIN_STATICRECOMP_HIDE_FILE_SELECT_ACTORS{
++    {System::Main, "GalaxyPC", "HideFileSelectActors"}, true};
++const Info<bool> MAIN_STATICRECOMP_HYBRID_PERFORMANCE{
++    {System::Main, "GalaxyPC", "HybridPerformance"}, true};
++const Info<bool> MAIN_STATICRECOMP_WIDESCREEN_CULLING_FIX{
++    {System::Main, "GalaxyPC", "WidescreenCullingFix"}, false};
++const Info<bool> MAIN_STATICRECOMP_INTERPOLATION{
++    {System::Main, "GalaxyPC", "PresentationInterpolation"}, false};
++const Info<u32> MAIN_STATICRECOMP_INTERPOLATION_RATE{
++    {System::Main, "GalaxyPC", "PresentationRate"}, 120};
++const Info<u32> MAIN_STATICRECOMP_CONTROLLER_LAYOUT{
++    {System::Main, "GalaxyPC", "ControllerLayout"}, 0};
++const Info<float> MAIN_STATICRECOMP_MOVE_DEADZONE{
++    {System::Main, "GalaxyPC", "MoveDeadzone"}, 12.0f};
++const Info<float> MAIN_STATICRECOMP_POINTER_DEADZONE{
++    {System::Main, "GalaxyPC", "PointerDeadzone"}, 8.0f};
++const Info<float> MAIN_STATICRECOMP_POINTER_SENSITIVITY{
++    {System::Main, "GalaxyPC", "PointerSensitivity"}, 1.0f};
++const Info<bool> MAIN_STATICRECOMP_GYRO_ENABLED{
++    {System::Main, "GalaxyPC", "GyroEnabled"}, true};
++const Info<float> MAIN_STATICRECOMP_GYRO_DEADZONE{
++    {System::Main, "GalaxyPC", "GyroDeadzone"}, 2.0f};
++const Info<u32> MAIN_STATICRECOMP_GYRO_CALIBRATION_PERIOD{
++    {System::Main, "GalaxyPC", "GyroCalibrationPeriod"}, 3};
+ }  // namespace Config
+diff --git a/Source/Core/Core/Config/StaticRecompSettings.h b/Source/Core/Core/Config/StaticRecompSettings.h
+index 59b64fe..c7c20c5 100644
+--- a/Source/Core/Core/Config/StaticRecompSettings.h
++++ b/Source/Core/Core/Config/StaticRecompSettings.h
+@@ -7,4 +7,17 @@ namespace Config
+ {
+ extern const Info<bool> MAIN_STATICRECOMP_MODULE;
+ extern const Info<u32> MAIN_STATICRECOMP_IDLE_PC;
++extern const Info<bool> MAIN_STATICRECOMP_CUSTOM_FRONTEND;
++extern const Info<bool> MAIN_STATICRECOMP_HIDE_FILE_SELECT_ACTORS;
++extern const Info<bool> MAIN_STATICRECOMP_HYBRID_PERFORMANCE;
++extern const Info<bool> MAIN_STATICRECOMP_WIDESCREEN_CULLING_FIX;
++extern const Info<bool> MAIN_STATICRECOMP_INTERPOLATION;
++extern const Info<u32> MAIN_STATICRECOMP_INTERPOLATION_RATE;
++extern const Info<u32> MAIN_STATICRECOMP_CONTROLLER_LAYOUT;
++extern const Info<float> MAIN_STATICRECOMP_MOVE_DEADZONE;
++extern const Info<float> MAIN_STATICRECOMP_POINTER_DEADZONE;
++extern const Info<float> MAIN_STATICRECOMP_POINTER_SENSITIVITY;
++extern const Info<bool> MAIN_STATICRECOMP_GYRO_ENABLED;
++extern const Info<float> MAIN_STATICRECOMP_GYRO_DEADZONE;
++extern const Info<u32> MAIN_STATICRECOMP_GYRO_CALIBRATION_PERIOD;
+ }  // namespace Config
+diff --git a/Source/Core/Core/HW/CPU.cpp b/Source/Core/Core/HW/CPU.cpp
+index 4a95a02..cf155a9 100644
+--- a/Source/Core/Core/HW/CPU.cpp
++++ b/Source/Core/Core/HW/CPU.cpp
+@@ -18,6 +18,7 @@
+ #include "Core/Host.h"
+ #include "Core/PowerPC/GDBStub.h"
+ #include "Core/PowerPC/PowerPC.h"
++#include "Core/PowerPC/StaticRecomp/StaticRecompCore.h"
+ #include "Core/System.h"
+ #include "Core/TimePlayed.h"
+ #include "VideoCommon/Fifo.h"
+@@ -237,6 +238,8 @@ void CPUManager::Stop()
+   // will stick permanently.
+   std::unique_lock state_lock(m_state_change_lock);
+   m_state = State::PowerDown;
++  if (g_static_recomp_core)
++    g_static_recomp_core->InterruptNativeDispatch();
+   m_state_cpu_cvar.notify_one();
+ 
+   while (m_state_cpu_thread_active)
+diff --git a/Source/Core/Core/HW/GPFifo.cpp b/Source/Core/Core/HW/GPFifo.cpp
+index 0de434b..2b44cf7 100644
+--- a/Source/Core/Core/HW/GPFifo.cpp
++++ b/Source/Core/Core/HW/GPFifo.cpp
+@@ -3,14 +3,18 @@
+ 
+ #include "Core/HW/GPFifo.h"
+ 
++#include <algorithm>
+ #include <cstddef>
+ #include <cstring>
++#include <fstream>
++#include <vector>
+ 
+ #include "Common/ChunkFile.h"
+ #include "Common/CommonTypes.h"
+ #include "Common/Swap.h"
+ #include "Core/HW/Memmap.h"
+ #include "Core/HW/ProcessorInterface.h"
++#include "Core/CoreTiming.h"
+ #include "Core/PowerPC/JitInterface.h"
+ #include "Core/PowerPC/PowerPC.h"
+ #include "Core/System.h"
+@@ -18,6 +22,57 @@
+ 
+ namespace GPFifo
+ {
++namespace
++{
++constexpr u64 FNV_OFFSET_BASIS = 14695981039346656037ull;
++constexpr u64 FNV_PRIME = 1099511628211ull;
++
++u64 s_burst_trace_limit = 0;
++u64 s_burst_trace_hash = FNV_OFFSET_BASIS;
++u32 s_burst_trace_context = 0;
++u64 s_burst_trace_dispatch = 0;
++u32 s_burst_trace_last_context = 0;
++u32 s_burst_trace_dispatch_entry = 0;
++u32 s_burst_trace_last_dispatch_entry = 0;
++u64 s_burst_trace_last_dispatch = 0;
++u64 s_burst_trace_last_ticks = 0;
++std::array<u8, GATHER_PIPE_SIZE> s_burst_trace_last_data{};
++std::vector<u64> s_burst_trace_prefixes;
++std::vector<u64> s_burst_trace_chunks;
++std::vector<u32> s_burst_trace_contexts;
++std::vector<u32> s_burst_trace_dispatch_entries;
++std::vector<u64> s_burst_trace_dispatches;
++std::vector<u64> s_burst_trace_ticks;
++std::vector<u8> s_burst_trace_data;
++
++void TraceBurst(const u8* data, u64 ticks)
++{
++  if (s_burst_trace_limit == 0 || s_burst_trace_prefixes.size() >= s_burst_trace_limit)
++    return;
++
++  u64 chunk_hash = FNV_OFFSET_BASIS;
++  for (size_t i = 0; i < GATHER_PIPE_SIZE; ++i)
++  {
++    s_burst_trace_hash ^= data[i];
++    s_burst_trace_hash *= FNV_PRIME;
++    chunk_hash ^= data[i];
++    chunk_hash *= FNV_PRIME;
++  }
++  std::copy_n(data, GATHER_PIPE_SIZE, s_burst_trace_last_data.begin());
++  s_burst_trace_last_context = s_burst_trace_context;
++  s_burst_trace_last_dispatch_entry = s_burst_trace_dispatch_entry;
++  s_burst_trace_last_dispatch = s_burst_trace_dispatch;
++  s_burst_trace_last_ticks = ticks;
++  s_burst_trace_prefixes.push_back(s_burst_trace_hash);
++  s_burst_trace_chunks.push_back(chunk_hash);
++  s_burst_trace_contexts.push_back(s_burst_trace_context);
++  s_burst_trace_dispatch_entries.push_back(s_burst_trace_dispatch_entry);
++  s_burst_trace_dispatches.push_back(s_burst_trace_dispatch);
++  s_burst_trace_ticks.push_back(ticks);
++  s_burst_trace_data.insert(s_burst_trace_data.end(), data, data + GATHER_PIPE_SIZE);
++}
++}  // namespace
++
+ GPFifoManager::GPFifoManager(Core::System& system) : m_system(system)
+ {
+ }
+@@ -92,6 +147,7 @@ void GPFifoManager::UpdateGatherPipe()
+   size_t processed;
+   for (processed = 0; pipe_count >= GATHER_PIPE_SIZE; processed += GATHER_PIPE_SIZE)
+   {
++    TraceBurst(m_gather_pipe + processed, m_system.GetCoreTiming().GetTicks());
+     // copy the GatherPipe
+     memory.CopyToEmu(processor_interface.m_fifo_cpu_write_pointer, m_gather_pipe + processed,
+                      GATHER_PIPE_SIZE);
+@@ -194,4 +250,95 @@ void FastCheckGatherPipe(GPFifoManager& gpfifo)
+ {
+   gpfifo.FastCheckGatherPipe();
+ }
++
++void ConfigureBurstTrace(u64 burst_limit)
++{
++  s_burst_trace_limit = burst_limit;
++  s_burst_trace_hash = FNV_OFFSET_BASIS;
++  s_burst_trace_context = 0;
++  s_burst_trace_dispatch = 0;
++  s_burst_trace_last_context = 0;
++  s_burst_trace_dispatch_entry = 0;
++  s_burst_trace_last_dispatch_entry = 0;
++  s_burst_trace_last_dispatch = 0;
++  s_burst_trace_last_ticks = 0;
++  s_burst_trace_last_data.fill(0);
++  s_burst_trace_prefixes.clear();
++  s_burst_trace_chunks.clear();
++  s_burst_trace_contexts.clear();
++  s_burst_trace_dispatch_entries.clear();
++  s_burst_trace_dispatches.clear();
++  s_burst_trace_ticks.clear();
++  s_burst_trace_data.clear();
++  if (burst_limit != 0)
++  {
++    s_burst_trace_prefixes.reserve(static_cast<size_t>(burst_limit));
++    s_burst_trace_chunks.reserve(static_cast<size_t>(burst_limit));
++    s_burst_trace_contexts.reserve(static_cast<size_t>(burst_limit));
++    s_burst_trace_dispatch_entries.reserve(static_cast<size_t>(burst_limit));
++    s_burst_trace_dispatches.reserve(static_cast<size_t>(burst_limit));
++    s_burst_trace_ticks.reserve(static_cast<size_t>(burst_limit));
++    s_burst_trace_data.reserve(static_cast<size_t>(burst_limit) * GATHER_PIPE_SIZE);
++  }
++}
++
++bool BurstTraceEnabled()
++{
++  return s_burst_trace_limit != 0;
++}
++
++void SetBurstTraceContext(u32 context, u64 dispatch)
++{
++  s_burst_trace_context = context;
++  s_burst_trace_dispatch = dispatch;
++}
++
++void SetBurstTraceDispatchEntry(u32 entry)
++{
++  s_burst_trace_dispatch_entry = entry;
++}
++
++BurstTraceSummary GetBurstTraceSummary()
++{
++  return {static_cast<u64>(s_burst_trace_prefixes.size()), s_burst_trace_limit,
++          s_burst_trace_prefixes.empty() ? FNV_OFFSET_BASIS : s_burst_trace_prefixes.back(),
++          s_burst_trace_last_context, s_burst_trace_last_dispatch_entry,
++          s_burst_trace_last_dispatch, s_burst_trace_last_ticks, s_burst_trace_last_data};
++}
++
++bool SaveBurstTrace(const std::string& path)
++{
++  std::ofstream file(path, std::ios::binary | std::ios::trunc);
++  if (!file)
++    return false;
++
++  file.write("MGFIFOH6", 8);
++  const u64 count = static_cast<u64>(s_burst_trace_prefixes.size());
++  file.write(reinterpret_cast<const char*>(&count), sizeof(count));
++  file.write(reinterpret_cast<const char*>(s_burst_trace_prefixes.data()),
++             static_cast<std::streamsize>(s_burst_trace_prefixes.size() * sizeof(u64)));
++  file.write(reinterpret_cast<const char*>(s_burst_trace_chunks.data()),
++             static_cast<std::streamsize>(s_burst_trace_chunks.size() * sizeof(u64)));
++  file.write(reinterpret_cast<const char*>(s_burst_trace_contexts.data()),
++             static_cast<std::streamsize>(s_burst_trace_contexts.size() * sizeof(u32)));
++  file.write(reinterpret_cast<const char*>(s_burst_trace_dispatch_entries.data()),
++             static_cast<std::streamsize>(s_burst_trace_dispatch_entries.size() * sizeof(u32)));
++  file.write(reinterpret_cast<const char*>(s_burst_trace_dispatches.data()),
++             static_cast<std::streamsize>(s_burst_trace_dispatches.size() * sizeof(u64)));
++  file.write(reinterpret_cast<const char*>(s_burst_trace_ticks.data()),
++             static_cast<std::streamsize>(s_burst_trace_ticks.size() * sizeof(u64)));
++  file.write(reinterpret_cast<const char*>(s_burst_trace_data.data()),
++             static_cast<std::streamsize>(s_burst_trace_data.size()));
++  file.write(reinterpret_cast<const char*>(&s_burst_trace_last_context),
++             sizeof(s_burst_trace_last_context));
++  file.write(reinterpret_cast<const char*>(&s_burst_trace_last_dispatch_entry),
++             sizeof(s_burst_trace_last_dispatch_entry));
++  file.write(reinterpret_cast<const char*>(&s_burst_trace_last_dispatch),
++             sizeof(s_burst_trace_last_dispatch));
++  file.write(reinterpret_cast<const char*>(&s_burst_trace_last_ticks),
++             sizeof(s_burst_trace_last_ticks));
++  file.write(reinterpret_cast<const char*>(s_burst_trace_last_data.data()),
++             static_cast<std::streamsize>(s_burst_trace_last_data.size()));
++  return file.good();
++}
+ }  // namespace GPFifo
+diff --git a/Source/Core/Core/HW/GPFifo.h b/Source/Core/Core/HW/GPFifo.h
+index 006c8ed..54884f1 100644
+--- a/Source/Core/Core/HW/GPFifo.h
++++ b/Source/Core/Core/HW/GPFifo.h
+@@ -3,6 +3,9 @@
+ 
+ #pragma once
+ 
++#include <array>
++#include <string>
++
+ #include "Common/CommonTypes.h"
+ 
+ class PointerWrap;
+@@ -65,4 +68,23 @@ private:
+ // For use from the JIT.
+ void UpdateGatherPipe(GPFifoManager& gpfifo);
+ void FastCheckGatherPipe(GPFifoManager& gpfifo);
++
++struct BurstTraceSummary
++{
++  u64 recorded_bursts = 0;
++  u64 requested_bursts = 0;
++  u64 final_hash = 0;
++  u32 last_context = 0;
++  u32 last_dispatch_entry = 0;
++  u64 last_dispatch = 0;
++  u64 last_ticks = 0;
++  std::array<u8, GATHER_PIPE_SIZE> last_data{};
++};
++
++void ConfigureBurstTrace(u64 burst_limit);
++bool BurstTraceEnabled();
++void SetBurstTraceContext(u32 context, u64 dispatch);
++void SetBurstTraceDispatchEntry(u32 entry);
++BurstTraceSummary GetBurstTraceSummary();
++bool SaveBurstTrace(const std::string& path);
+ }  // namespace GPFifo
+diff --git a/Source/Core/Core/HW/Wiimote.cpp b/Source/Core/Core/HW/Wiimote.cpp
+index 97a0b5a..c2142df 100644
+--- a/Source/Core/Core/HW/Wiimote.cpp
++++ b/Source/Core/Core/HW/Wiimote.cpp
+@@ -8,6 +8,7 @@
+ #include "Common/ChunkFile.h"
+ #include "Common/CommonTypes.h"
+ #include "Common/Config/Config.h"
++#include "Common/FrontendInput.h"
+ 
+ #include "Core/Config/WiimoteSettings.h"
+ #include "Core/Config/ConfigManager.h"
+@@ -99,6 +100,22 @@ namespace Wiimote
+ {
+ static InputConfig s_config(WIIMOTE_INI_NAME, _trans("Wii Remote"), "Wiimote", "Wiimote");
+ 
++void PublishFrontendButtons(unsigned int index, u16 buttons)
++{
++  if (index == 0)
++    FrontendInput::PublishButtons(buttons);
++}
++
++u16 GetFrontendButtons(unsigned int index)
++{
++  return index == 0 ? FrontendInput::GetButtons() : 0;
++}
++
++bool IsFrontendCapturingInput(unsigned int index)
++{
++  return index == 0 && FrontendInput::IsFileSelectInputBlocked();
++}
++
+ InputConfig* GetConfig()
+ {
+   return &s_config;
+@@ -176,6 +193,8 @@ void Shutdown()
+ 
+ void Initialize(InitializeMode init_mode)
+ {
++  FrontendInput::Reset();
++
+   if (s_config.ControllersNeedToBeCreated())
+   {
+     for (unsigned int i = WIIMOTE_CHAN_0; i < MAX_BBMOTES; ++i)
+diff --git a/Source/Core/Core/HW/Wiimote.h b/Source/Core/Core/HW/Wiimote.h
+index f4b34f4..d459f9a 100644
+--- a/Source/Core/Core/HW/Wiimote.h
++++ b/Source/Core/Core/HW/Wiimote.h
+@@ -81,6 +81,9 @@ void LoadConfig();
+ void GenerateDynamicInputTextures();
+ void Resume();
+ void Pause();
++void PublishFrontendButtons(unsigned int index, u16 buttons);
++u16 GetFrontendButtons(unsigned int index);
++bool IsFrontendCapturingInput(unsigned int index);
+ 
+ void DoState(PointerWrap& p);
+ InputConfig* GetConfig();
+diff --git a/Source/Core/Core/HW/WiimoteEmu/WiimoteEmu.cpp b/Source/Core/Core/HW/WiimoteEmu/WiimoteEmu.cpp
+index 3350787..e988ad1 100644
+--- a/Source/Core/Core/HW/WiimoteEmu/WiimoteEmu.cpp
++++ b/Source/Core/Core/HW/WiimoteEmu/WiimoteEmu.cpp
+@@ -16,6 +16,7 @@
+ #include "Common/CommonTypes.h"
+ #include "Common/Config/Config.h"
+ #include "Common/FileUtil.h"
++#include "Common/FrontendInput.h"
+ #include "Common/Logging/Log.h"
+ #include "Common/MathUtil.h"
+ 
+@@ -399,6 +400,19 @@ void Wiimote::BuildDesiredWiimoteState(DesiredWiimoteState* target_state,
+   m_dpad->GetState(&target_state->buttons.hex,
+                    IsSideways() ? dpad_sideways_bitmasks : dpad_bitmasks,
+                    m_input_override_function);
++  ::Wiimote::PublishFrontendButtons(m_index, target_state->buttons.hex);
++  const bool frontend_capturing = ::Wiimote::IsFrontendCapturingInput(m_index);
++  if (frontend_capturing)
++  {
++    target_state->buttons.hex &=
++        ~(BUTTON_A | BUTTON_B | PAD_UP | PAD_DOWN | PAD_LEFT | PAD_RIGHT);
++  }
++  if (m_index == 0)
++  {
++    const int rumble = FrontendInput::ConsumeRumbleState();
++    if (rumble >= 0)
++      m_rumble->controls.front()->control_ref->State(rumble != 0);
++  }
+ 
+   // Calculate accelerometer state.
+   // Calibration values are 8-bit but we want 10-bit precision, so << 2.
+@@ -406,7 +420,11 @@ void Wiimote::BuildDesiredWiimoteState(DesiredWiimoteState* target_state,
+       ConvertAccelData(GetTotalAcceleration(), ACCEL_ZERO_G << 2, ACCEL_ONE_G << 2);
+ 
+   // Calculate IR camera state.
+-  if (m_ir_passthrough->enabled.GetValue() && m_ir_passthrough->AreInputsBound())
++  if (frontend_capturing)
++  {
++    target_state->camera_points = DesiredWiimoteState::DEFAULT_CAMERA;
++  }
++  else if (m_ir_passthrough->enabled.GetValue() && m_ir_passthrough->AreInputsBound())
+   {
+     target_state->camera_points = GetPassthroughCameraPoints(m_ir_passthrough);
+   }
+diff --git a/Source/Core/Core/PowerPC/Jit64/Jit.h b/Source/Core/Core/PowerPC/Jit64/Jit.h
+index da1be2d..8495d4a 100644
+--- a/Source/Core/Core/PowerPC/Jit64/Jit.h
++++ b/Source/Core/Core/PowerPC/Jit64/Jit.h
+@@ -91,6 +91,15 @@ public:
+ 
+   const CommonAsmRoutines* GetAsmRoutines() override { return &asm_routines; }
+   const char* GetName() const override { return "JIT64"; }
++  void SetExitAfterSlice(bool value) override
++  {
++    asm_routines.SetExitAfterSlice(value);
++    // A slice-leased JIT re-enters through Run() constantly; keep the BLR
++    // stack guard disarmed so ProtectStack stays a no-op and stack faults
++    // cannot originate from leased slices.
++    if (value)
++      m_enable_blr_optimization = false;
++  }
+   // Run!
+   void Run() override;
+   void SingleStep() override;
+diff --git a/Source/Core/Core/PowerPC/Jit64/JitAsm.cpp b/Source/Core/Core/PowerPC/Jit64/JitAsm.cpp
+index 7594d0e..91c9c0d 100644
+--- a/Source/Core/Core/PowerPC/Jit64/JitAsm.cpp
++++ b/Source/Core/Core/PowerPC/Jit64/JitAsm.cpp
+@@ -230,7 +230,13 @@ void Jit64AsmRoutineManager::Generate()
+   // Gets checked on at the end of every slice
+   MOV(64, R(RSCRATCH), ImmPtr(system.GetCPU().GetStatePtr()));
+   CMP(32, MatR(RSCRATCH), Imm32(std::to_underlying(CPU::State::Running)));
++  FixupBranch state_exit = J_CC(CC_NE);
++  // A slice-leased caller (StaticRecompCore fallback) wants control back at
++  // every slice boundary; the flag is constant false in standalone JIT runs.
++  MOV(64, R(RSCRATCH), ImmPtr(&m_exit_after_slice));
++  CMP(8, MatR(RSCRATCH), Imm8(0));
+   J_CC(CC_E, outerLoop);
++  SetJumpTarget(state_exit);
+ 
+   // Landing pad for drec space
+   dispatcher_exit = GetCodePtr();
+diff --git a/Source/Core/Core/PowerPC/Jit64/JitAsm.h b/Source/Core/Core/PowerPC/Jit64/JitAsm.h
+index 4db3c8f..d0ac16f 100644
+--- a/Source/Core/Core/PowerPC/Jit64/JitAsm.h
++++ b/Source/Core/Core/PowerPC/Jit64/JitAsm.h
+@@ -39,7 +39,14 @@ public:
+ 
+   void ResetStack(Gen::X64CodeBlock& emitter);
+ 
++  // When set, enter_code returns to the caller at the end of every timing
++  // slice instead of looping. StaticRecompCore uses this to lease single
++  // slices to the fallback JIT for code outside the recompiled module.
++  void SetExitAfterSlice(bool value) { m_exit_after_slice = value; }
++
+ private:
+   void Generate();
+   void GenerateCommon();
++
++  bool m_exit_after_slice = false;
+ };
+diff --git a/Source/Core/Core/PowerPC/JitCommon/JitBase.h b/Source/Core/Core/PowerPC/JitCommon/JitBase.h
+index 8643497..55bc4e8 100644
+--- a/Source/Core/Core/PowerPC/JitCommon/JitBase.h
++++ b/Source/Core/Core/PowerPC/JitCommon/JitBase.h
+@@ -229,6 +229,10 @@ public:
+   virtual bool HandleFault(uintptr_t access_address, SContext* ctx) = 0;
+   bool HandleStackFault();
+ 
++  // Slice-leased execution: when supported and enabled, Run() returns to the
++  // caller at every timing-slice boundary instead of looping until shutdown.
++  virtual void SetExitAfterSlice(bool) {}
++
+   static constexpr std::size_t code_buffer_size = 32000;
+ 
+   // This should probably be removed from public:
+diff --git a/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore.cpp b/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore.cpp
+index 605f7db..80ebbba 100644
+--- a/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore.cpp
++++ b/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore.cpp
+@@ -4,6 +4,7 @@
+ #include "Core/PowerPC/StaticRecomp/StaticRecompCore.h"
+ 
+ #include <cstdio>
++#include <cstdlib>
+ #include <cstring>
+ 
+ #include "Common/Config/Config.h"
+@@ -109,6 +110,15 @@ void StaticRecompCore::Init()
+ 
+   LoadModule();
+   m_idle_pc = Config::Get(Config::MAIN_STATICRECOMP_IDLE_PC);
++  if (const char* value = std::getenv("STATICRECOMP_INTERPRET_START"))
++    m_force_interpreter_start = static_cast<u32>(std::strtoull(value, nullptr, 0));
++  if (const char* value = std::getenv("STATICRECOMP_INTERPRET_END"))
++    m_force_interpreter_end = static_cast<u32>(std::strtoull(value, nullptr, 0));
++  if (m_force_interpreter_start < m_force_interpreter_end)
++  {
++    std::fprintf(stderr, "[staticrecomp] forced interpreter range: [0x%08X,0x%08X)\n",
++                 m_force_interpreter_start, m_force_interpreter_end);
++  }
+   m_lockstep_verifier = std::make_unique<StaticRecompLockstep::StaticRecompLockstepVerifier>(*this);
+   m_lockstep_verifier->Init();
+ 
+@@ -117,8 +127,31 @@ void StaticRecompCore::Init()
+ #elif defined(_M_X86_64)
+   m_fallback_jit = std::make_unique<Jit64>(m_system);
+ #endif
++  // JitInterface::UpdateMembase consults the ACTIVE core's jo to pick
++  // ppc_state.mem_ptr. The fallback JIT compiles fastmem accesses against
++  // that pointer, so this core's fastmem view must match the fallback's or
++  // leased slices write through the wrong base and corrupt host memory.
++  InitFastmemArena();
++  jo.fastmem = Config::Get(Config::MAIN_FASTMEM) && jo.fastmem_arena;
++
+   if (m_fallback_jit)
+     m_fallback_jit->Init();
++
++  // Out-of-module code (exception vectors, runtime-loaded MEM2 modules such
++  // as RMGE01's HomeButtonMenuWrapperRSO) runs through the fallback JIT one
++  // timing slice at a time. The single-step interpreter remains available for
++  // lockstep verification and forced-interpreter range bisection.
++  m_jit_fallback = m_fallback_jit != nullptr &&
++                   !(m_force_interpreter_start < m_force_interpreter_end) &&
++                   std::getenv("STATICRECOMP_INTERP_FALLBACK") == nullptr;
++  if (const char* value = std::getenv("STATICRECOMP_JITFB_MIN"))
++    m_jit_fallback_min_pc = static_cast<u32>(std::strtoull(value, nullptr, 0));
++  if (m_jit_fallback)
++  {
++    m_fallback_jit->SetExitAfterSlice(true);
++    std::fprintf(stderr, "[staticrecomp] fallback engine: %s (slice-leased, min_pc=0x%08X)\n",
++                 m_fallback_jit->GetName(), m_jit_fallback_min_pc);
++  }
+ }
+ 
+ void StaticRecompCore::Shutdown()
+@@ -126,18 +159,21 @@ void StaticRecompCore::Shutdown()
+   g_static_recomp_core = nullptr;
+   std::fprintf(stderr,
+                "[staticrecomp] shutdown: native=%llu fallback=%llu native_exc=%llu hook_fb=%llu "
+-               "smc_failed=%u verifications=%llu reverify_events=%llu\n",
++               "smc_failed=%u verifications=%llu reverify_events=%llu charged_cycles=%llu "
++               "jit_slices=%llu\n",
+                (unsigned long long)m_native_dispatches, (unsigned long long)m_fallback_steps,
+                (unsigned long long)m_native_exceptions,
+                (unsigned long long)m_hook_fallback_instructions, m_failed_chunks,
+-               (unsigned long long)m_verifications, (unsigned long long)m_reverify_events);
++               (unsigned long long)m_verifications, (unsigned long long)m_reverify_events,
++               (unsigned long long)m_charged_cycles,
++               (unsigned long long)m_fallback_jit_slices);
+   NOTICE_LOG_FMT(POWERPC,
+                  "StaticRecomp: shutdown. native_dispatches={} fallback_steps={} "
+                  "native_exceptions={} hook_fallback_instructions={} smc_failed_chunks={} "
+-                 "verifications={} reverify_events={}",
++                 "verifications={} reverify_events={} charged_cycles={}",
+                  m_native_dispatches, m_fallback_steps, m_native_exceptions,
+                  m_hook_fallback_instructions, m_failed_chunks, m_verifications,
+-                 m_reverify_events);
++                 m_reverify_events, m_charged_cycles);
+   m_lockstep_verifier.reset();
+   m_block_cache.Shutdown();
+   m_module = nullptr;
+diff --git a/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore.h b/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore.h
+index 26a364d..5ca5dfd 100644
+--- a/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore.h
++++ b/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore.h
+@@ -53,10 +53,16 @@ public:
+   bool IsModuleActive() const;
+   bool DispatchableAt(u32 address);
+   bool FastDispatchableAt(u32 address) const;
++  void InterruptNativeDispatch() { m_guest.dispatch_budget = 0; }
+ 
+   void ClearCache() override;
+   void Jit(u32 em_address) override {}
+-  bool HandleFault(uintptr_t access_address, SContext* ctx) override { return false; }
++  // Fastmem faults can only originate from the fallback JIT's generated code;
++  // the static module performs all guest accesses through the runtime hooks.
++  bool HandleFault(uintptr_t access_address, SContext* ctx) override
++  {
++    return m_fallback_jit && m_fallback_jit->HandleFault(access_address, ctx);
++  }
+ 
+   JitBaseBlockCache* GetBlockCache() override { return &m_block_cache; }
+   void EraseSingleBlock(const JitBlock& block) override {}
+@@ -127,6 +133,11 @@ private:
+   static void HookExternalWrite32(CPUState* cpu, u32 ea, u32 value, u8 rid);
+   static void* HookExternalPointer(CPUState* cpu, u32 ea, u32 size);
+   static void HookInstructionFallback(CPUState* cpu, u32 raw, u32 cia);
++  static bool HookHostCall(CPUState* cpu, u32 address);
++  bool PrepareFileSelect(CPUState* cpu);
++  bool HandleFileSelectGate(CPUState* cpu);
++  bool HideFileSelectActors(u32 selector, u32 small_data_area);
++  void RestoreFileSelectActors();
+ 
+   // Keep Dolphin's MSR-derived state (translation mode, feature flags) in step
+   // with the guest MSR before any MMU access or exception delivery.
+@@ -160,6 +171,7 @@ private:
+   std::vector<int> m_chunk_lookup_table;
+   u32 m_lookup_ram_size = 0;
+   u32 m_lookup_exram_size = 0;
++  u32 CanonicalCodeAddress(u32 address) const;
+   int GetAddressLookupIndex(u32 address) const;
+   void InitLookupTable(u32 ram_size, u32 exram_size);
+ 
+@@ -168,6 +180,15 @@ private:
+   mutable u32 m_last_chunk_index = 0;
+ 
+   u32 m_idle_pc = 0;
++  u32 m_force_interpreter_start = 0;
++  u32 m_force_interpreter_end = 0;
++  bool m_jit_fallback = false;
++  u32 m_jit_fallback_min_pc = 0;
++  u64 m_fallback_jit_slices = 0;
++  bool m_gameplay_performance_mode = false;
++
++  std::unordered_map<u32, u8> m_file_select_visibility;
++  u32 m_file_selector = 0;
+ };
+ 
+ extern StaticRecompCore* g_static_recomp_core;
+diff --git a/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_Hooks.cpp b/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_Hooks.cpp
+index bf7534c..4d365e6 100644
+--- a/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_Hooks.cpp
++++ b/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_Hooks.cpp
+@@ -2,6 +2,11 @@
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
+ #include "Core/PowerPC/StaticRecomp/StaticRecompCore.h"
++#include <array>
++#include <cstdio>
++#include "Common/FrontendInput.h"
++#include "Core/Config/StaticRecompSettings.h"
++#include "Core/HW/Memmap.h"
+ #include "Core/System.h"
+ #include "Core/PowerPC/MMU.h"
+ #include "Core/PowerPC/PowerPC.h"
+@@ -14,6 +19,315 @@
+ namespace
+ {
+ constexpr u32 LOCKED_CACHE_BASE = 0xE0000000u;
++constexpr u32 RMGE01_FILE_SELECT_PREPARE = 0x4D474B00u;
++constexpr u32 RMGE01_FILE_SELECT_GATE = 0x4D474B01u;
++constexpr u32 RMGE01_TITLE_CONFIRM_GATE = 0x4D474B02u;
++constexpr u32 FILE_SELECTOR_ITEMS_OFFSET = 0x94;
++constexpr u32 FILE_SELECTOR_SELECT_EFFECT_OFFSET = 0xEC;
++constexpr u32 FILE_SELECT_ITEM_PLANET_OFFSET = 0x90;
++constexpr u32 FILE_SELECT_ITEM_MODELS_OFFSET = 0x98;
++constexpr u32 FILE_SELECT_ITEM_MII_FACE_OFFSET = 0x9C;
++constexpr u32 FILE_SELECT_ITEM_NUMBER_OFFSET = 0xA0;
++constexpr u32 FILE_SELECT_ITEM_INDEX_OFFSET = 0x140;
++constexpr u32 FILE_SELECT_ITEM_DELEGATOR_OFFSET = 0x150;
++constexpr u32 FILE_SELECT_DELEGATOR_SELECTOR_OFFSET = 0x04;
++constexpr u32 LIVE_ACTOR_HIDDEN_MODEL_OFFSET = 0x6C;
++constexpr u32 LAYOUT_ACTOR_HIDDEN_OFFSET = 0x1E;
++constexpr u32 NAME_OBJ_GROUP_COUNT_OFFSET = 0x10;
++constexpr u32 NAME_OBJ_GROUP_OBJECTS_OFFSET = 0x14;
++constexpr u32 GAME_SYSTEM_SINGLETON_SDA_OFFSET = 14968;
++constexpr u32 GAME_SYSTEM_OBJ_HOLDER_OFFSET = 0x20;
++constexpr u32 GAME_SYSTEM_STAR_POINTER_DIRECTOR_OFFSET = 0x30;
++constexpr u32 STAR_POINTER_DIRECTOR_GUIDANCE_OFFSET = 0x14;
++constexpr u32 FILE_SELECT_ITEM_COUNT = 6;
++
++constexpr std::array<u32, 10> FILE_SELECTOR_LAYOUT_OFFSETS = {
++    0x9C, 0xA0, 0xA4, 0xA8, 0xAC, 0xB0, 0xC4, 0xD4, 0xD8, 0xE0};
++
++struct FileSelectItemGraph
++{
++  u32 item = 0;
++  u32 planet = 0;
++  std::array<u32, 5> models{};
++  u32 face = 0;
++  u32 number = 0;
++};
++
++bool IsGuestRamRange(Memory::MemoryManager& memory, u32 address, u32 size)
++{
++  if (size == 0 || (address & 0x80000000u) == 0)
++    return false;
++
++  const u32 physical = address & 0x3FFFFFFFu;
++  const u32 ram_size = memory.GetRamSizeReal();
++  if (physical < ram_size && size <= ram_size - physical)
++    return true;
++
++  constexpr u32 exram_base = 0x10000000u;
++  const u32 exram_size = memory.GetExRamSizeReal();
++  return physical >= exram_base && physical - exram_base < exram_size &&
++         size <= exram_size - (physical - exram_base);
++}
++
++bool IsOptionalActor(Memory::MemoryManager& memory, u32 actor, u32 flag_offset)
++{
++  return actor == 0 || IsGuestRamRange(memory, actor, flag_offset + 1);
++}
++
++void SaveAndHide(Memory::MemoryManager& memory, std::unordered_map<u32, u8>& saved,
++                 u32 address)
++{
++  if (address == 0)
++    return;
++  if (!saved.contains(address))
++    saved.emplace(address, memory.Read_U8(address));
++  memory.Write_U8(1, address);
++}
++
++void SaveAndHideActor(Memory::MemoryManager& memory, std::unordered_map<u32, u8>& saved,
++                       u32 actor, u32 flag_offset)
++{
++  if (actor != 0)
++    SaveAndHide(memory, saved, actor + flag_offset);
++}
++
++}
++
++bool StaticRecompCore::HookHostCall(CPUState* cpu, u32 address)
++{
++  if (cpu == nullptr || cpu->external_user_data == nullptr)
++    return false;
++
++  auto* core = static_cast<StaticRecompCore*>(cpu->external_user_data);
++  if (address == RMGE01_TITLE_CONFIRM_GATE)
++    return FrontendInput::IsTitleConfirmed();
++  if (address == RMGE01_FILE_SELECT_PREPARE)
++  {
++    core->PrepareFileSelect(cpu);
++    return false;
++  }
++  return address == RMGE01_FILE_SELECT_GATE && core->HandleFileSelectGate(cpu);
++}
++
++bool StaticRecompCore::PrepareFileSelect(CPUState* cpu)
++{
++  if (!Config::Get(Config::MAIN_STATICRECOMP_CUSTOM_FRONTEND))
++  {
++    RestoreFileSelectActors();
++    if (FrontendInput::IsFileSelectCaptured())
++      FrontendInput::ReleaseFileSelect();
++    return false;
++  }
++
++  if (FrontendInput::IsFileSelectReleased())
++  {
++    RestoreFileSelectActors();
++    return false;
++  }
++
++  if (!FrontendInput::IsFileSelectCaptured())
++    FrontendInput::CaptureFileSelect();
++
++  if (Config::Get(Config::MAIN_STATICRECOMP_HIDE_FILE_SELECT_ACTORS))
++  {
++    if (!HideFileSelectActors(cpu->gpr[31], cpu->gpr[13]))
++    {
++      std::fprintf(
++          stderr,
++          "[staticrecomp] RMGE01 file selector graph validation failed; using native menu\n");
++      RestoreFileSelectActors();
++      FrontendInput::ReleaseFileSelect();
++      return false;
++    }
++  }
++  else
++  {
++    RestoreFileSelectActors();
++  }
++
++  return true;
++}
++
++bool StaticRecompCore::HandleFileSelectGate(CPUState* cpu)
++{
++  if (FrontendInput::IsFileSelectReleased())
++  {
++    RestoreFileSelectActors();
++    return false;
++  }
++
++  if (FrontendInput::IsFileSelectReady())
++  {
++    if (Config::Get(Config::MAIN_STATICRECOMP_HIDE_FILE_SELECT_ACTORS) &&
++        !HideFileSelectActors(cpu->gpr[31], cpu->gpr[13]))
++    {
++      RestoreFileSelectActors();
++      FrontendInput::ReleaseFileSelect();
++      return false;
++    }
++    return true;
++  }
++
++  if (!PrepareFileSelect(cpu))
++    return false;
++
++  FrontendInput::MarkFileSelectReady();
++  return true;
++}
++
++bool StaticRecompCore::HideFileSelectActors(u32 selector, u32 small_data_area)
++{
++  if (selector == m_file_selector && !m_file_select_visibility.empty())
++  {
++    auto& memory = m_system.GetMemory();
++    for (const auto& entry : m_file_select_visibility)
++      memory.Write_U8(1, entry.first);
++    return true;
++  }
++
++  auto& memory = m_system.GetMemory();
++  if (!IsGuestRamRange(memory, selector, 0xF0))
++    return false;
++
++  const u32 group = memory.Read_U32(selector + FILE_SELECTOR_ITEMS_OFFSET);
++  if (!IsGuestRamRange(memory, group, NAME_OBJ_GROUP_OBJECTS_OFFSET + sizeof(u32)) ||
++      memory.Read_U32(group + NAME_OBJ_GROUP_COUNT_OFFSET) != FILE_SELECT_ITEM_COUNT)
++  {
++    return false;
++  }
++
++  const u32 objects = memory.Read_U32(group + NAME_OBJ_GROUP_OBJECTS_OFFSET);
++  if (!IsGuestRamRange(memory, objects, FILE_SELECT_ITEM_COUNT * sizeof(u32)))
++    return false;
++
++  std::array<FileSelectItemGraph, FILE_SELECT_ITEM_COUNT> items{};
++  u32 seen_indices = 0;
++  for (u32 i = 0; i < FILE_SELECT_ITEM_COUNT; ++i)
++  {
++    FileSelectItemGraph& graph = items[i];
++    graph.item = memory.Read_U32(objects + i * sizeof(u32));
++    if (!IsGuestRamRange(memory, graph.item, 0x170))
++      return false;
++
++    const u32 item_index = memory.Read_U32(graph.item + FILE_SELECT_ITEM_INDEX_OFFSET);
++    if (item_index < 1 || item_index > FILE_SELECT_ITEM_COUNT ||
++        (seen_indices & (1u << (item_index - 1))) != 0)
++    {
++      return false;
++    }
++    seen_indices |= 1u << (item_index - 1);
++
++    const u32 delegator = memory.Read_U32(graph.item + FILE_SELECT_ITEM_DELEGATOR_OFFSET);
++    if (!IsGuestRamRange(memory, delegator, FILE_SELECT_DELEGATOR_SELECTOR_OFFSET + sizeof(u32)) ||
++        memory.Read_U32(delegator + FILE_SELECT_DELEGATOR_SELECTOR_OFFSET) != selector)
++    {
++      return false;
++    }
++
++    graph.planet = memory.Read_U32(graph.item + FILE_SELECT_ITEM_PLANET_OFFSET);
++    const u32 models = memory.Read_U32(graph.item + FILE_SELECT_ITEM_MODELS_OFFSET);
++    graph.face = memory.Read_U32(graph.item + FILE_SELECT_ITEM_MII_FACE_OFFSET);
++    graph.number = memory.Read_U32(graph.item + FILE_SELECT_ITEM_NUMBER_OFFSET);
++    if (!IsOptionalActor(memory, graph.planet, LIVE_ACTOR_HIDDEN_MODEL_OFFSET) ||
++        !IsGuestRamRange(memory, models,
++                         static_cast<u32>(graph.models.size() * sizeof(u32))) ||
++        !IsOptionalActor(memory, graph.face, LIVE_ACTOR_HIDDEN_MODEL_OFFSET) ||
++        !IsOptionalActor(memory, graph.number, LAYOUT_ACTOR_HIDDEN_OFFSET))
++    {
++      return false;
++    }
++
++    for (u32 model_index = 0; model_index < graph.models.size(); ++model_index)
++    {
++      graph.models[model_index] = memory.Read_U32(models + model_index * sizeof(u32));
++      if (!IsOptionalActor(memory, graph.models[model_index], LIVE_ACTOR_HIDDEN_MODEL_OFFSET))
++        return false;
++    }
++  }
++
++  std::array<u32, FILE_SELECTOR_LAYOUT_OFFSETS.size()> layouts{};
++  for (u32 i = 0; i < layouts.size(); ++i)
++  {
++    layouts[i] = memory.Read_U32(selector + FILE_SELECTOR_LAYOUT_OFFSETS[i]);
++    if (!IsOptionalActor(memory, layouts[i], LAYOUT_ACTOR_HIDDEN_OFFSET))
++      return false;
++  }
++
++  const u32 select_effect = memory.Read_U32(selector + FILE_SELECTOR_SELECT_EFFECT_OFFSET);
++  if (!IsOptionalActor(memory, select_effect, LIVE_ACTOR_HIDDEN_MODEL_OFFSET))
++    return false;
++
++  if (!IsGuestRamRange(memory, small_data_area - GAME_SYSTEM_SINGLETON_SDA_OFFSET,
++                       sizeof(u32)))
++  {
++    return false;
++  }
++  const u32 game_system =
++      memory.Read_U32(small_data_area - GAME_SYSTEM_SINGLETON_SDA_OFFSET);
++  if (!IsGuestRamRange(memory, game_system, GAME_SYSTEM_OBJ_HOLDER_OFFSET + sizeof(u32)))
++    return false;
++  const u32 object_holder = memory.Read_U32(game_system + GAME_SYSTEM_OBJ_HOLDER_OFFSET);
++  if (!IsGuestRamRange(memory, object_holder,
++                       GAME_SYSTEM_STAR_POINTER_DIRECTOR_OFFSET + sizeof(u32)))
++  {
++    return false;
++  }
++  const u32 star_pointer_director =
++      memory.Read_U32(object_holder + GAME_SYSTEM_STAR_POINTER_DIRECTOR_OFFSET);
++  if (!IsGuestRamRange(memory, star_pointer_director,
++                       STAR_POINTER_DIRECTOR_GUIDANCE_OFFSET + sizeof(u32)))
++  {
++    return false;
++  }
++  const u32 star_pointer_guidance =
++      memory.Read_U32(star_pointer_director + STAR_POINTER_DIRECTOR_GUIDANCE_OFFSET);
++  if (!IsOptionalActor(memory, star_pointer_guidance, LAYOUT_ACTOR_HIDDEN_OFFSET))
++    return false;
++
++  RestoreFileSelectActors();
++  m_file_selector = selector;
++  for (const FileSelectItemGraph& graph : items)
++  {
++    SaveAndHideActor(memory, m_file_select_visibility, graph.item,
++                     LIVE_ACTOR_HIDDEN_MODEL_OFFSET);
++    SaveAndHideActor(memory, m_file_select_visibility, graph.planet,
++                     LIVE_ACTOR_HIDDEN_MODEL_OFFSET);
++    for (const u32 model : graph.models)
++      SaveAndHideActor(memory, m_file_select_visibility, model,
++                       LIVE_ACTOR_HIDDEN_MODEL_OFFSET);
++    SaveAndHideActor(memory, m_file_select_visibility, graph.face,
++                     LIVE_ACTOR_HIDDEN_MODEL_OFFSET);
++    SaveAndHideActor(memory, m_file_select_visibility, graph.number, LAYOUT_ACTOR_HIDDEN_OFFSET);
++  }
++  for (const u32 layout : layouts)
++    SaveAndHideActor(memory, m_file_select_visibility, layout, LAYOUT_ACTOR_HIDDEN_OFFSET);
++  SaveAndHideActor(memory, m_file_select_visibility, select_effect,
++                   LIVE_ACTOR_HIDDEN_MODEL_OFFSET);
++  SaveAndHideActor(memory, m_file_select_visibility, star_pointer_guidance,
++                   LAYOUT_ACTOR_HIDDEN_OFFSET);
++
++  std::fprintf(stderr, "[staticrecomp] RMGE01 native file selector hidden (%zu flags)\n",
++               m_file_select_visibility.size());
++  return true;
++}
++
++void StaticRecompCore::RestoreFileSelectActors()
++{
++  if (m_file_select_visibility.empty())
++  {
++    m_file_selector = 0;
++    return;
++  }
++
++  auto& memory = m_system.GetMemory();
++  for (const auto& [address, value] : m_file_select_visibility)
++  {
++    if (IsGuestRamRange(memory, address, 1))
++      memory.Write_U8(value, address);
++  }
++  std::fprintf(stderr, "[staticrecomp] RMGE01 native file selector restored\n");
++  m_file_select_visibility.clear();
++  m_file_selector = 0;
+ }
+ 
+ u64 StaticRecompCore::HookExternalRead(CPUState* cpu, u32 ea, u8 size)
+@@ -59,6 +373,7 @@ void StaticRecompCore::HookExternalWrite(CPUState* cpu, u32 ea, u64 value, u8 si
+   // maintains ppc_state.gather_pipe_ptr internally.
+   if ((ea & 0xFFFFF000) == 0xCC008000u)
+   {
++    GPFifo::SetBurstTraceContext(cpu->pc, core->m_native_dispatches);
+     if (core->m_lockstep_verifier->m_ls_journaling)
+       core->m_lockstep_verifier->m_journal.native_mmio.push_back({ea, static_cast<u32>(value), size});
+     auto& gpfifo = core->m_system.GetGPFifo();
+@@ -191,6 +506,9 @@ void StaticRecompCore::HookInstructionFallback(CPUState* cpu, u32 raw, u32 cia)
+       if (xo == 982u)
+       {
+         system.GetJitInterface().InvalidateICacheLine(ea);
++        // Do not enter another generated block until the chassis has
++        // revalidated the invalidated code chunk.
++        cpu->dispatch_budget = 0;
+       }
+       // These bypass SingleStepInner, so charge Dolphin's PPCTables cost
+       // here (icbi 4, dcbf/dcbst/dcbi 5); their emitted block cost is zero.
+diff --git a/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_Run.cpp b/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_Run.cpp
+index 062245d..11d75a6 100644
+--- a/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_Run.cpp
++++ b/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_Run.cpp
+@@ -2,13 +2,21 @@
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
+ #include "Core/PowerPC/StaticRecomp/StaticRecompCore.h"
++#include "Common/FrontendInput.h"
++#include "Core/HW/GPFifo.h"
++#include <algorithm>
++#include <cstdio>
++#include <cstring>
++#include <unordered_map>
+ #include "Core/System.h"
+ #include "Core/PowerPC/PowerPC.h"
+ #include "Core/PowerPC/Interpreter/Interpreter.h"
++#include "Core/PowerPC/PPCAnalyst.h"
+ #include "Core/PowerPC/StaticRecomp/StaticRecompLockstep.h"
+ #include "Core/CoreTiming.h"
+ #include "Core/HW/CPU.h"
+ #include "Core/Config/MainSettings.h"
++#include "Core/Config/StaticRecompSettings.h"
+ #include "Core/Config/ConfigManager.h"
+ #include "Core/HW/SystemTimers.h"
+ 
+@@ -16,6 +24,8 @@ namespace
+ {
+ constexpr u32 SYNC_EXCEPTION_MASK = ~static_cast<u32>(
+     EXCEPTION_EXTERNAL_INT | EXCEPTION_DECREMENTER | EXCEPTION_PERFORMANCE_MONITOR);
++constexpr s64 MAX_NATIVE_DISPATCH_CYCLES = 262144;
++constexpr u32 RMGE01_UPDATE_CLIPPING_FRUSTUM = 0x80160150;
+ }
+ 
+ void StaticRecompCore::Run()
+@@ -26,6 +36,33 @@ void StaticRecompCore::Run()
+   auto& interpreter = m_system.GetInterpreter();
+   auto& memory = m_system.GetMemory();
+   const CPU::State* state_ptr = m_system.GetCPU().GetStatePtr();
++  u64 timing_slices = 0;
++  u64 next_progress_dispatch = 10000000;
++  std::unordered_map<u32, bool> idle_loop_cache;
++  const bool is_rmge01 = m_module && std::strcmp(m_module->game_id, "RMGE01") == 0;
++  bool hybrid_gameplay_logged = false;
++
++  const auto is_idle_loop = [&idle_loop_cache](u32 address) {
++    if (const auto it = idle_loop_cache.find(address); it != idle_loop_cache.end())
++      return it->second;
++
++    PPCAnalyst::BlockStats stats{};
++    PPCAnalyst::BlockRegStats gpa{};
++    PPCAnalyst::BlockRegStats fpa{};
++    PPCAnalyst::CodeBlock block{};
++    block.m_stats = &stats;
++    block.m_gpa = &gpa;
++    block.m_fpa = &fpa;
++    PPCAnalyst::CodeBuffer code(64);
++    PPCAnalyst::PPCAnalyzer analyzer;
++    analyzer.Analyze(address, &block, &code, code.size());
++    const bool idle = std::any_of(code.begin(), code.begin() + block.m_num_instructions,
++                                  [](const auto& op) { return op.branchIsIdleLoop; });
++    idle_loop_cache.emplace(address, idle);
++    if (idle)
++      std::fprintf(stderr, "[staticrecomp] detected idle loop: pc=0x%08X\n", address);
++    return idle;
++  };
+ 
+   m_guest.ram = memory.GetRAM();
+   m_guest.ram_size = memory.GetRamSizeReal();
+@@ -45,48 +82,104 @@ void StaticRecompCore::Run()
+   while (*state_ptr == CPU::State::Running)
+   {
+     core_timing.Advance();
+-    const std::string current_game_id = SConfig::GetInstance().GetGameID();
+-    m_module_active = m_module && (current_game_id.empty() || current_game_id == m_module->game_id);
++    ++timing_slices;
+ 
+     do
+     {
++      if (is_rmge01 && FrontendInput::IsFileSelectReleased() &&
++          !m_gameplay_performance_mode)
++      {
++        RestoreFileSelectActors();
++        m_gameplay_performance_mode = true;
++      }
++      const bool use_hybrid_gameplay =
++          is_rmge01 && m_jit_fallback &&
++          Config::Get(Config::MAIN_STATICRECOMP_HYBRID_PERFORMANCE) &&
++          m_gameplay_performance_mode;
++      if (use_hybrid_gameplay && !hybrid_gameplay_logged)
++      {
++        std::fprintf(stderr, "[staticrecomp] hybrid gameplay core active\n");
++        hybrid_gameplay_logged = true;
++      }
++
+       // MSR.FP needs no gate here: generated FPU instructions raise the
+       // FP-unavailable exception themselves (ppc_fp_available).
+-      if (m_module_active && DispatchableAt(ppc.pc))
++      if (m_module_active && !use_hybrid_gameplay && DispatchableAt(ppc.pc))
+       {
++        // Both diagnostics are compile-once conditions on the hot path: skip
++        // the out-of-line calls entirely in normal runs.
++        const bool lockstep_enabled = m_lockstep_verifier->IsEnabled();
++        const bool trace_enabled = GPFifo::BurstTraceEnabled();
+         SyncIn();
+         ++m_bursts;
+         do
+         {
+-          const bool do_ls = m_lockstep_verifier->ShouldCheck(m_guest.pc);
++          u32 dispatch_pc = m_guest.pc;
++          const bool file_select_dispatch =
++              is_rmge01 && dispatch_pc >= 0x8017C7B4 && dispatch_pc < 0x8017D0A0;
++          if ((dispatch_pc >= 0x8038F084 && dispatch_pc < 0x8038F418) || file_select_dispatch)
++            FrontendInput::ObserveGuestPc(dispatch_pc);
++          const bool do_ls = lockstep_enabled && m_lockstep_verifier->ShouldCheck(dispatch_pc);
+           if (do_ls)
+           {
+             m_lockstep_verifier->Prepare(m_guest);
+           }
+ 
+-          m_module->dispatch(&m_guest, m_guest.pc);
++          m_guest.dispatch_budget =
++              std::clamp<s64>(ppc.downcount, 1, MAX_NATIVE_DISPATCH_CYCLES);
++          m_guest.host_call = is_rmge01 && FrontendInput::IsTitleConfirmed() &&
++                                      (!FrontendInput::IsFileSelectReleased() ||
++                                       !m_file_select_visibility.empty()) ?
++                                  HookHostCall :
++                                  nullptr;
++          if (trace_enabled)
++            GPFifo::SetBurstTraceDispatchEntry(dispatch_pc);
++          if (is_rmge01 &&
++              Config::Get(Config::MAIN_STATICRECOMP_WIDESCREEN_CULLING_FIX) &&
++              dispatch_pc == RMGE01_UPDATE_CLIPPING_FRUSTUM)
++          {
++            m_guest.pc = m_guest.lr & ~3u;
++            --m_guest.downcount;
++          }
++          else
++          {
++            m_module->dispatch(&m_guest, dispatch_pc);
++          }
++          m_guest.host_call = nullptr;
+           ++m_native_dispatches;
++          if (m_native_dispatches >= next_progress_dispatch)
++          {
++            std::fprintf(stderr,
++                         "[staticrecomp] native progress: dispatches=%llu pc=0x%08X "
++                         "downcount=%d slices=%llu ticks=%llu bursts=%llu\n",
++                         (unsigned long long)m_native_dispatches, m_guest.pc, ppc.downcount,
++                         (unsigned long long)timing_slices,
++                         (unsigned long long)core_timing.GetTicks(),
++                         (unsigned long long)m_bursts);
++            next_progress_dispatch = m_native_dispatches + 10000000;
++          }
+ 
+           if (do_ls)
+           {
+             m_lockstep_verifier->Verify(m_guest);
+           }
+ 
+-          // Flush the module's per-block cycle charges into Dolphin's
+-          // downcount. A dispatch that charged nothing (PC-switch default,
+-          // pure embedded data) still costs 1 so the burst always makes
+-          // downcount progress; this per-dispatch flush is also the
+-          // dispatcher back-edge timing check — CoreTiming regains control
+-          // with at least CachedInterpreter's per-block frequency, so
+-          // external-interrupt latency matches stock.
++          // Flush the module's accumulated per-block cycle charges into
++          // Dolphin's downcount. A dispatch that charged nothing (PC-switch
++          // default, pure embedded data) still costs 1 so the burst always
++          // makes progress; this per-dispatch flush is also the dispatcher
++          // back-edge timing check.
+           const s64 charge = -m_guest.downcount;
+           m_guest.downcount = 0;
+           ppc.downcount -= static_cast<int>(charge > 0 ? charge : 1);
+           m_charged_cycles += static_cast<u64>(charge > 0 ? charge : 1);
+           m_guest.timebase += static_cast<u64>(charge > 0 ? charge : 1);
+ 
+-          // Idle loop skipping for configured target loops (e.g. Wii Menu OSIdleThread)
+-          if (m_guest.pc == m_idle_pc && m_idle_pc != 0)
++          // Match Dolphin's JIT busy-wait handling for native blocks. The
++          // configured PC remains useful for loops that the conservative
++          // analyzer cannot prove idle.
++          if ((m_guest.pc == m_idle_pc && m_idle_pc != 0) ||
++              (m_guest.pc == dispatch_pc && is_idle_loop(dispatch_pc)))
+           {
+             m_system.GetCoreTiming().Idle();
+           }
+@@ -110,25 +203,48 @@ void StaticRecompCore::Run()
+         if ((ppc.Exceptions & SYNC_EXCEPTION_MASK) != 0)
+           power_pc.CheckExceptions();
+       }
++      else if (m_jit_fallback && ppc.pc >= m_jit_fallback_min_pc)
++      {
++        // Lease one timing slice to the fallback JIT. It compiles and runs
++        // whatever the guest PC points at (exception vectors, MEM2-resident
++        // modules) and returns when the slice's downcount is exhausted; the
++        // loop then re-checks whether the PC is back in module-covered code.
++        ++m_fallback_jit_slices;
++        m_fallback_jit->Run();
++      }
+       else
+       {
+         // SingleStepInner delivers synchronous exceptions itself; external
+         // interrupts are delivered at slice start, as in Interpreter::Run.
+-        if (m_fallback_jit)
++        if (m_fallback_steps == 0)
+         {
+-          m_fallback_jit->Run();
++          const u32 offset = ppc.pc & 0x01FFFFFFu;
++          const u8* ram = memory.GetRAM();
++          const u32 raw = offset + 3 < memory.GetRamSizeReal() ?
++                              (static_cast<u32>(ram[offset]) << 24) |
++                                  (static_cast<u32>(ram[offset + 1]) << 16) |
++                                  (static_cast<u32>(ram[offset + 2]) << 8) | ram[offset + 3] :
++                              0;
++          std::fprintf(stderr,
++                       "[staticrecomp] first block fallback: pc=0x%08X raw=0x%08X msr=0x%08X "
++                       "srr0=0x%08X srr1=0x%08X\n",
++                       ppc.pc, raw, ppc.msr.Hex, SRR0(ppc), SRR1(ppc));
+         }
+-        else
++        do
+         {
+-          do
+-          {
+-            ppc.downcount -= interpreter.SingleStepInner();
+-            ++m_fallback_steps;
+-          } while (!(m_module_active && DispatchableAt(ppc.pc)) && ppc.downcount > 0 &&
+-                   *state_ptr == CPU::State::Running);
+-        }
++          ppc.downcount -= interpreter.SingleStepInner();
++          ++m_fallback_steps;
++          if (m_fallback_steps <= 16)
++            std::fprintf(stderr, "[staticrecomp] fallback step: steps=%llu pc=0x%08X\n",
++                         (unsigned long long)m_fallback_steps, ppc.pc);
++          if ((m_fallback_steps % 1000000) == 0)
++            std::fprintf(stderr, "[staticrecomp] fallback progress: steps=%llu pc=0x%08X\n",
++                         (unsigned long long)m_fallback_steps, ppc.pc);
++        } while (!(m_module_active && DispatchableAt(ppc.pc)) && ppc.downcount > 0 &&
++                 *state_ptr == CPU::State::Running);
+       }
+     } while (ppc.downcount > 0 && *state_ptr == CPU::State::Running);
++
+   }
+ }
+ 
+diff --git a/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_SMC.cpp b/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_SMC.cpp
+index 9e4f51f..29bf60a 100644
+--- a/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_SMC.cpp
++++ b/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_SMC.cpp
+@@ -9,8 +9,18 @@
+ #include <algorithm>
+ #include <cstdio>
+ 
++u32 StaticRecompCore::CanonicalCodeAddress(u32 address) const
++{
++  if (address < m_lookup_ram_size)
++    return address | 0x80000000u;
++  if (address >= 0x10000000u && address < 0x10000000u + m_lookup_exram_size)
++    return address | 0x80000000u;
++  return address;
++}
++
+ int StaticRecompCore::GetAddressLookupIndex(u32 address) const
+ {
++  address = CanonicalCodeAddress(address);
+   if (address >= 0x80000000u && address < 0x80000000u + m_lookup_ram_size)
+     return static_cast<int>((address - 0x80000000u) >> 2);
+   if (address >= 0x90000000u && address < 0x90000000u + m_lookup_exram_size)
+@@ -65,12 +75,16 @@ int StaticRecompCore::ChunkIndexOf(u32 address) const
+ 
+ bool StaticRecompCore::FastDispatchableAt(u32 address) const
+ {
++  if (address >= m_force_interpreter_start && address < m_force_interpreter_end)
++    return false;
+   const int index = ChunkIndexOf(address);
+   return index >= 0 && m_chunk_state[index] == CHUNK_VERIFIED;
+ }
+ 
+ bool StaticRecompCore::DispatchableAt(u32 address)
+ {
++  if (address >= m_force_interpreter_start && address < m_force_interpreter_end)
++    return false;
+   const int index = ChunkIndexOf(address);
+   if (index < 0)
+     return false;
+@@ -134,6 +148,7 @@ void StaticRecompCore::OnICacheInvalidate(u32 address, u32 length)
+ 
+   if (!m_module_active || length == 0)
+     return;
++  address = CanonicalCodeAddress(address);
+   const u32 last = address + (length - 1u);
+ 
+   // Binary search to find the first chunk index that could possibly overlap (chunk.end > address)
+diff --git a/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_Sync.cpp b/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_Sync.cpp
+index c2482a7..0969fd5 100644
+--- a/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_Sync.cpp
++++ b/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_Sync.cpp
+@@ -5,6 +5,7 @@
+ #include "Core/System.h"
+ #include "Core/PowerPC/PowerPC.h"
+ #include "Core/HW/SystemTimers.h"
++#include <algorithm>
+ #include <cstring>
+ 
+ void StaticRecompCore::SetPPCStateFromGuestState(const CPUState& s, PowerPC::PowerPCState& ppc)
+@@ -72,6 +73,7 @@ void StaticRecompCore::SyncIn()
+   m_guest.exception = 0;
+   m_guest.program_exception = 0;
+   m_guest.downcount = 0;  // charge accumulator, not a copy of ppc.downcount
++  m_guest.dispatch_budget = std::max<s64>(ppc.downcount, 1);
+ 
+   if (m_module && m_module->on_state_loaded)
+     m_module->on_state_loaded(&m_guest);
+diff --git a/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompLockstep.cpp b/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompLockstep.cpp
+index da9fb99..47a1c3e 100644
+--- a/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompLockstep.cpp
++++ b/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompLockstep.cpp
+@@ -68,6 +68,10 @@ void StaticRecompLockstepVerifier::Init()
+     m_ls_start = std::strtoull(s, nullptr, 0);
+   if (const char* s = std::getenv("STATICRECOMP_LOCKSTEP_LIMIT"))
+     m_ls_limit = std::strtoull(s, nullptr, 0);
++  if (const char* s = std::getenv("STATICRECOMP_LOCKSTEP_TARGET"))
++    m_ls_target_pc = static_cast<u32>(std::strtoull(s, nullptr, 0));
++  if (const char* s = std::getenv("STATICRECOMP_LOCKSTEP_MAXCHECKS"))
++    m_ls_max_checks = std::strtoull(s, nullptr, 0);
+   if (const char* s = std::getenv("STATICRECOMP_LOCKSTEP_MAXREPORT"))
+     m_ls_max_report = std::strtoull(s, nullptr, 0);
+   if (const char* s = std::getenv("STATICRECOMP_LOCKSTEP_STEPCAP"))
+@@ -92,8 +96,10 @@ void StaticRecompLockstepVerifier::Init()
+ 
+   std::fprintf(
+       stderr,
+-      "[lockstep] ENABLED: start=%llu limit=%llu maxreport=%llu stepcap=%d whitelist=%zu\n",
++      "[lockstep] ENABLED: start=%llu limit=%llu target=0x%08X maxchecks=%llu "
++      "maxreport=%llu stepcap=%d whitelist=%zu\n",
+       (unsigned long long)m_ls_start, (unsigned long long)m_ls_limit,
++      m_ls_target_pc, (unsigned long long)m_ls_max_checks,
+       (unsigned long long)m_ls_max_report, m_ls_step_cap, m_ls_whitelist.size());
+ }
+ 
+@@ -103,6 +109,10 @@ bool StaticRecompLockstepVerifier::ShouldCheck(u32 address) const
+     return false;
+   if (!LockstepWindowOpen())
+     return false;
++  if (m_ls_max_checks != 0 && m_ls_checks >= m_ls_max_checks)
++    return false;
++  if (m_ls_target_pc != 0)
++    return address == m_ls_target_pc;
+   return m_ls_checked.find(address) == m_ls_checked.end();
+ }
+ 
+diff --git a/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompLockstep.h b/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompLockstep.h
+index 3e8a0ee..e68d5b7 100644
+--- a/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompLockstep.h
++++ b/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompLockstep.h
+@@ -144,6 +144,8 @@ private:
+   bool m_lockstep = false;
+   u64 m_ls_start = 0;             // begin checking at this native-dispatch index
+   u64 m_ls_limit = 0;            // stop checking after this index (0 = no bound)
++  u32 m_ls_target_pc = 0;       // repeatedly check one dispatch entry (0 = dedupe PCs)
++  u64 m_ls_max_checks = 0;      // cap checks in target mode (0 = unlimited)
+   u64 m_ls_max_report = 0;      // cap divergence reports (0 = unlimited)
+   int m_ls_step_cap = 512;      // interpreter single-steps before giving up on end PC
+   u64 m_ls_checks = 0;          // distinct blocks differentially checked
+diff --git a/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompLockstep_Check.cpp b/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompLockstep_Check.cpp
+index 6e72cb5..560ee6e 100644
+--- a/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompLockstep_Check.cpp
++++ b/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompLockstep_Check.cpp
+@@ -175,7 +175,7 @@ void StaticRecompLockstepVerifier::LockstepCheck(u32 entry_pc, u32 end_pc, const
+                    steps, before, ppc.gpr[3], ppc.gpr[4], ppc.gpr[5], ppc.msr.Hex,
+                    ppc.GetXER().Hex, ppc.cr.Get(), ppc.spr[SPR_LR], ppc.spr[SPR_CTR]);
+     }
+-    if (ppc.pc == end_pc)
++    if (ppc.pc == end_pc && (!end_is_loop_header || interp_cycles >= native_charge))
+       break;
+     if (ppc.Exceptions != 0)
+       break;
+diff --git a/Source/Core/DolphinNoGUI/PlatformWin32.cpp b/Source/Core/DolphinNoGUI/PlatformWin32.cpp
+index 09527be..25f2922 100644
+--- a/Source/Core/DolphinNoGUI/PlatformWin32.cpp
++++ b/Source/Core/DolphinNoGUI/PlatformWin32.cpp
+@@ -3,14 +3,18 @@
+ 
+ #include "DolphinNoGUI/Platform.h"
+ 
++#include "Common/StringUtil.h"
+ #include "Core/Config/MainSettings.h"
+ #include "Core/Config/ConfigManager.h"
+ #include "Core/Core.h"
+ #include "Core/System.h"
+ 
+ #include <Windows.h>
++#include <chrono>
+ #include <climits>
+ #include <dwmapi.h>
++#include <tchar.h>
++#include <thread>
+ 
+ #include "VideoCommon/Present.h"
+ #include "resource.h"
+@@ -35,10 +39,14 @@ private:
+ 
+   static bool RegisterRenderWindowClass();
+   bool CreateRenderWindow();
++  void SetFullscreen(bool fullscreen);
+   void UpdateWindowPosition();
+   void ProcessEvents();
+ 
+   HWND m_hwnd{};
++  WINDOWPLACEMENT m_windowed_placement{sizeof(WINDOWPLACEMENT)};
++  DWORD m_windowed_style = WS_OVERLAPPEDWINDOW;
++  DWORD m_windowed_ex_style = WS_EX_CLIENTEDGE;
+ 
+   int m_window_x = Config::Get(Config::MAIN_RENDER_WINDOW_XPOS);
+   int m_window_y = Config::Get(Config::MAIN_RENDER_WINDOW_YPOS);
+@@ -63,7 +71,7 @@ bool PlatformWin32::RegisterRenderWindowClass()
+   wc.hInstance = GetModuleHandle(nullptr);
+   wc.hIcon = LoadIcon(nullptr, IDI_ICON1);
+   wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
+-  wc.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1);
++  wc.hbrBackground = static_cast<HBRUSH>(GetStockObject(BLACK_BRUSH));
+   wc.lpszMenuName = nullptr;
+   wc.lpszClassName = WINDOW_CLASS_NAME;
+   wc.hIconSm = LoadIcon(nullptr, IDI_ICON1);
+@@ -99,11 +107,7 @@ bool PlatformWin32::Init()
+   if (!RegisterRenderWindowClass() || !CreateRenderWindow())
+     return false;
+ 
+-  // TODO: Enter fullscreen if enabled.
+-  if (Config::Get(Config::MAIN_FULLSCREEN))
+-  {
+-    ProcessEvents();
+-  }
++  SetFullscreen(Config::Get(Config::MAIN_FULLSCREEN));
+ 
+   if (Config::Get(Config::MAIN_DISABLE_SCREENSAVER))
+     SetThreadExecutionState(ES_CONTINUOUS | ES_DISPLAY_REQUIRED | ES_SYSTEM_REQUIRED);
+@@ -112,6 +116,46 @@ bool PlatformWin32::Init()
+   return true;
+ }
+ 
++void PlatformWin32::SetFullscreen(bool fullscreen)
++{
++  if (!m_hwnd || fullscreen == m_window_fullscreen)
++    return;
++
++  if (fullscreen)
++  {
++    m_windowed_style = static_cast<DWORD>(GetWindowLongPtr(m_hwnd, GWL_STYLE));
++    m_windowed_ex_style = static_cast<DWORD>(GetWindowLongPtr(m_hwnd, GWL_EXSTYLE));
++    m_windowed_placement.length = sizeof(WINDOWPLACEMENT);
++    GetWindowPlacement(m_hwnd, &m_windowed_placement);
++
++    const HMONITOR monitor = MonitorFromWindow(m_hwnd, MONITOR_DEFAULTTONEAREST);
++    MONITORINFO monitor_info{sizeof(MONITORINFO)};
++    if (!GetMonitorInfo(monitor, &monitor_info))
++      return;
++
++    SetWindowLongPtr(m_hwnd, GWL_STYLE, WS_POPUP | WS_VISIBLE);
++    SetWindowLongPtr(m_hwnd, GWL_EXSTYLE, WS_EX_APPWINDOW);
++    const RECT& rect = monitor_info.rcMonitor;
++    SetWindowPos(m_hwnd, HWND_TOP, rect.left, rect.top, rect.right - rect.left,
++                 rect.bottom - rect.top, SWP_FRAMECHANGED | SWP_NOOWNERZORDER);
++    m_window_fullscreen = true;
++  }
++  else
++  {
++    SetWindowLongPtr(m_hwnd, GWL_STYLE, m_windowed_style);
++    SetWindowLongPtr(m_hwnd, GWL_EXSTYLE, m_windowed_ex_style);
++    SetWindowPlacement(m_hwnd, &m_windowed_placement);
++    SetWindowPos(m_hwnd, nullptr, 0, 0, 0, 0,
++                 SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER |
++                     SWP_NOOWNERZORDER);
++    m_window_fullscreen = false;
++  }
++
++  Config::SetBaseOrCurrent(Config::MAIN_FULLSCREEN, fullscreen);
++  if (g_presenter)
++    g_presenter->ResizeSurface();
++}
++
+ void PlatformWin32::SetTitle(const std::string& string)
+ {
+   SetWindowTextW(m_hwnd, UTF8ToWString(string).c_str());
+@@ -199,9 +243,36 @@ LRESULT PlatformWin32::WndProc(const HWND hwnd, const UINT msg, const WPARAM wPa
+ 
+   case WM_KEYDOWN:
+     if (wParam == VK_ESCAPE)
+-      platform->RequestShutdown();
++    {
++      if (platform->m_window_fullscreen)
++        platform->SetFullscreen(false);
++      else
++        platform->RequestShutdown();
++    }
++    else if (wParam == VK_F2 && g_presenter)
++      g_presenter->ToggleOnScreenSettings();
++    else if (wParam == VK_F11 ||
++             (wParam == VK_RETURN && (GetKeyState(VK_MENU) & 0x8000) != 0))
++      platform->SetFullscreen(!platform->m_window_fullscreen);
+     break;
+ 
++  // Feed the mouse to ImGui while the in-game settings panel is open so its
++  // widgets are clickable; the emulated pointer keeps receiving input via
++  // ControllerInterface as usual.
++  case WM_MOUSEMOVE:
++    if (g_presenter && g_presenter->IsOnScreenSettingsVisible())
++    {
++      g_presenter->SetMousePos(static_cast<float>(static_cast<short>(LOWORD(lParam))),
++                               static_cast<float>(static_cast<short>(HIWORD(lParam))));
++    }
++    return DefWindowProc(hwnd, msg, wParam, lParam);
++
++  case WM_LBUTTONDOWN:
++  case WM_LBUTTONUP:
++    if (g_presenter && g_presenter->IsOnScreenSettingsVisible())
++      g_presenter->SetMousePress(msg == WM_LBUTTONDOWN ? 1u : 0u);
++    return DefWindowProc(hwnd, msg, wParam, lParam);
++
+   case WM_CLOSE:
+     platform->RequestShutdown();
+     break;
+diff --git a/Source/Core/VideoBackends/D3D/D3DGfx.cpp b/Source/Core/VideoBackends/D3D/D3DGfx.cpp
+index dc7ee37..7bd8d14 100644
+--- a/Source/Core/VideoBackends/D3D/D3DGfx.cpp
++++ b/Source/Core/VideoBackends/D3D/D3DGfx.cpp
+@@ -170,6 +170,11 @@ void Gfx::PresentBackbuffer()
+   m_swap_chain->Present();
+ }
+ 
++bool Gfx::PresentBackbufferNonBlocking()
++{
++  return m_swap_chain->Present(true);
++}
++
+ void Gfx::OnConfigChanged(u32 bits)
+ {
+   AbstractGfx::OnConfigChanged(bits);
+diff --git a/Source/Core/VideoBackends/D3D/D3DGfx.h b/Source/Core/VideoBackends/D3D/D3DGfx.h
+index 1c65485..32f7e7a 100644
+--- a/Source/Core/VideoBackends/D3D/D3DGfx.h
++++ b/Source/Core/VideoBackends/D3D/D3DGfx.h
+@@ -65,6 +65,7 @@ public:
+                              u32 groupsize_z, u32 groups_x, u32 groups_y, u32 groups_z) override;
+   bool BindBackbuffer(const ClearColor& clear_color = {}) override;
+   void PresentBackbuffer() override;
++  bool PresentBackbufferNonBlocking() override;
+   void SetFullscreen(bool enable_fullscreen) override;
+   bool IsFullscreen() const override;
+ 
+diff --git a/Source/Core/VideoBackends/D3D12/D3D12SwapChain.cpp b/Source/Core/VideoBackends/D3D12/D3D12SwapChain.cpp
+index a292797..da3ebbf 100644
+--- a/Source/Core/VideoBackends/D3D12/D3D12SwapChain.cpp
++++ b/Source/Core/VideoBackends/D3D12/D3D12SwapChain.cpp
+@@ -68,9 +68,9 @@ void SwapChain::DestroySwapChainBuffers()
+   m_buffers.clear();
+ }
+ 
+-bool SwapChain::Present()
++bool SwapChain::Present(bool non_blocking)
+ {
+-  if (!D3DCommon::SwapChain::Present())
++  if (!D3DCommon::SwapChain::Present(non_blocking))
+     return false;
+ 
+   m_current_buffer = (m_current_buffer + 1) % SWAP_CHAIN_BUFFER_COUNT;
+diff --git a/Source/Core/VideoBackends/D3D12/D3D12SwapChain.h b/Source/Core/VideoBackends/D3D12/D3D12SwapChain.h
+index d7db3e7..bb20552 100644
+--- a/Source/Core/VideoBackends/D3D12/D3D12SwapChain.h
++++ b/Source/Core/VideoBackends/D3D12/D3D12SwapChain.h
+@@ -27,7 +27,7 @@ public:
+ 
+   static std::unique_ptr<SwapChain> Create(const WindowSystemInfo& wsi);
+ 
+-  bool Present() override;
++  bool Present(bool non_blocking = false) override;
+ 
+   DXTexture* GetCurrentTexture() const { return m_buffers[m_current_buffer].texture.get(); }
+   DXFramebuffer* GetCurrentFramebuffer() const
+diff --git a/Source/Core/VideoBackends/D3DCommon/SwapChain.cpp b/Source/Core/VideoBackends/D3DCommon/SwapChain.cpp
+index 1c91275..4ce3221 100644
+--- a/Source/Core/VideoBackends/D3DCommon/SwapChain.cpp
++++ b/Source/Core/VideoBackends/D3DCommon/SwapChain.cpp
+@@ -293,7 +293,7 @@ bool SwapChain::CheckForFullscreenChange()
+   return false;
+ }
+ 
+-bool SwapChain::Present()
++bool SwapChain::Present(bool non_blocking)
+ {
+   // When using sync interval 0, it is recommended to always pass the tearing flag when it is
+   // supported, even when presenting in windowed mode. However, this flag cannot be used if the app
+@@ -301,8 +301,12 @@ bool SwapChain::Present()
+   UINT present_flags = 0;
+   if (m_allow_tearing_supported && !g_ActiveConfig.bVSyncActive && !m_has_fullscreen)
+     present_flags |= DXGI_PRESENT_ALLOW_TEARING;
++  if (non_blocking)
++    present_flags |= DXGI_PRESENT_DO_NOT_WAIT;
+ 
+   HRESULT hr = m_swap_chain->Present(static_cast<UINT>(g_ActiveConfig.bVSyncActive), present_flags);
++  if (non_blocking && hr == DXGI_ERROR_WAS_STILL_DRAWING)
++    return false;
+   if (FAILED(hr))
+   {
+     WARN_LOG_FMT(VIDEO, "Swap chain present failed: {}", Common::HRWrap(hr));
+diff --git a/Source/Core/VideoBackends/D3DCommon/SwapChain.h b/Source/Core/VideoBackends/D3DCommon/SwapChain.h
+index 7d489cc..12ed9b1 100644
+--- a/Source/Core/VideoBackends/D3DCommon/SwapChain.h
++++ b/Source/Core/VideoBackends/D3DCommon/SwapChain.h
+@@ -43,7 +43,7 @@ public:
+   bool CheckForFullscreenChange();
+ 
+   // Presents the swap chain to the screen.
+-  virtual bool Present();
++  virtual bool Present(bool non_blocking = false);
+ 
+   bool ChangeSurface(void* native_handle);
+   bool ResizeSwapChain();
+diff --git a/Source/Core/VideoCommon/AbstractGfx.h b/Source/Core/VideoCommon/AbstractGfx.h
+index 3a3c72c..1773701 100644
+--- a/Source/Core/VideoCommon/AbstractGfx.h
++++ b/Source/Core/VideoCommon/AbstractGfx.h
+@@ -109,6 +109,11 @@ public:
+ 
+   // Presents the backbuffer to the window system, or "swaps buffers".
+   virtual void PresentBackbuffer() {}
++  virtual bool PresentBackbufferNonBlocking()
++  {
++    PresentBackbuffer();
++    return true;
++  }
+ 
+   // Shader modules/objects.
+   virtual std::unique_ptr<AbstractShader>
+diff --git a/Source/Core/VideoCommon/FramebufferShaderGen.cpp b/Source/Core/VideoCommon/FramebufferShaderGen.cpp
+index 248146e..04b5d08 100644
+--- a/Source/Core/VideoCommon/FramebufferShaderGen.cpp
++++ b/Source/Core/VideoCommon/FramebufferShaderGen.cpp
+@@ -328,6 +328,50 @@ std::string GenerateTextureCopyPixelShader()
+   return code.GetBuffer();
+ }
+ 
++std::string GenerateInterFrameVertexShader()
++{
++  ShaderCode code;
++  EmitUniformBufferDeclaration(code);
++  code.Write("{{\n"
++             "  float interpolation_alpha;\n"
++             "  float3 padding;\n"
++             "  float4 src_rect;\n"
++             "}};\n\n");
++  EmitVertexMainDeclaration(code, 0, 0, false, 1, 0, "#define id gl_VertexID\n");
++  code.Write(
++      "{{\n"
++      "  v_tex0 = float3(float((id << 1) & 2), float(id & 2), 0.0f);\n"
++      "  opos = float4(v_tex0.xy * float2(2.0f, -2.0f) + float2(-1.0f, 1.0f), 0.0f, 1.0f);\n"
++      "  v_tex0.xy = src_rect.xy + (src_rect.zw * v_tex0.xy);\n");
++  if (GetAPIType() == APIType::Vulkan)
++    code.Write("  opos.y = -opos.y;\n");
++  code.Write("}}\n");
++  return code.GetBuffer();
++}
++
++std::string GenerateInterFramePixelShader()
++{
++  ShaderCode code;
++  EmitUniformBufferDeclaration(code);
++  code.Write("{{\n"
++             "  float interpolation_alpha;\n"
++             "  float3 padding;\n"
++             "  float4 src_rect;\n"
++             "}};\n\n");
++  EmitSamplerDeclarations(code, 0, 2, false);
++  EmitPixelMainDeclaration(code, 1, 0);
++  code.Write("{{\n"
++             "  float4 previous_color = ");
++  EmitSampleTexture(code, 0, "v_tex0");
++  code.Write(";\n"
++             "  float4 current_color = ");
++  EmitSampleTexture(code, 1, "v_tex0");
++  code.Write(";\n"
++             "  ocol0 = lerp(previous_color, current_color, interpolation_alpha);\n"
++             "}}\n");
++  return code.GetBuffer();
++}
++
+ std::string GenerateColorPixelShader()
+ {
+   ShaderCode code;
+diff --git a/Source/Core/VideoCommon/FramebufferShaderGen.h b/Source/Core/VideoCommon/FramebufferShaderGen.h
+index c97fec8..2e8a799 100644
+--- a/Source/Core/VideoCommon/FramebufferShaderGen.h
++++ b/Source/Core/VideoCommon/FramebufferShaderGen.h
+@@ -15,6 +15,8 @@ std::string GenerateScreenQuadVertexShader();
+ std::string GeneratePassthroughGeometryShader(u32 num_tex, u32 num_colors);
+ std::string GenerateTextureCopyVertexShader();
+ std::string GenerateTextureCopyPixelShader();
++std::string GenerateInterFrameVertexShader();
++std::string GenerateInterFramePixelShader();
+ std::string GenerateResolveColorPixelShader(u32 samples);
+ std::string GenerateResolveDepthPixelShader(u32 samples);
+ std::string GenerateClearVertexShader();
+diff --git a/Source/Core/VideoCommon/OnScreenUI.cpp b/Source/Core/VideoCommon/OnScreenUI.cpp
+index 451109b..b95f437 100644
+--- a/Source/Core/VideoCommon/OnScreenUI.cpp
++++ b/Source/Core/VideoCommon/OnScreenUI.cpp
+@@ -3,17 +3,29 @@
+ 
+ #include "VideoCommon/OnScreenUI.h"
+ 
++#include <cmath>
++#include <cstdlib>
++
++#include "AudioCommon/Mixer.h"
++#include "AudioCommon/SoundStream.h"
+ #include "Common/CommonPaths.h"
+ #include "Common/EnumMap.h"
+ #include "Common/FileUtil.h"
++#include "Common/FrontendInput.h"
++#include "Common/NandPaths.h"
+ #include "Common/Profiler.h"
+ #include "Common/Timer.h"
+ 
+ #include "Core/Achievements/AchievementManager.h"
+ #include "Core/Config/AchievementSettings.h"
++#include "Core/Config/ConfigManager.h"
+ #include "Core/Config/GraphicsSettings.h"
+ #include "Core/Config/MainSettings.h"
+ #include "Core/Config/NetplaySettings.h"
++#include "Core/Config/StaticRecompSettings.h"
++#include "Core/Core.h"
++#include "Core/HW/Wiimote.h"
++#include "Core/HW/WiimoteEmu/WiimoteEmu.h"
+ #include "Core/Movie.h"
+ #include "Core/System.h"
+ 
+@@ -32,6 +44,7 @@
+ #include "VideoCommon/VideoConfig.h"
+ 
+ #include <inttypes.h>
++#include <algorithm>
+ #include <mutex>
+ 
+ #include <imgui.h>
+@@ -39,6 +52,40 @@
+ 
+ namespace VideoCommon
+ {
++namespace
++{
++void PlayFrontendTone(float frequency, int milliseconds, float gain)
++{
++  SoundStream* const stream = Core::System::GetInstance().GetSoundStream();
++  if (!stream)
++    return;
++
++  constexpr int sample_rate = 8000;
++  constexpr float tau = 6.28318530718f;
++  const int frames = sample_rate * milliseconds / 1000;
++  std::vector<u8> samples(static_cast<std::size_t>(frames) * 2);
++  for (int i = 0; i < frames; ++i)
++  {
++    const float time = static_cast<float>(i) / sample_rate;
++    const float attack = std::min(1.0f, static_cast<float>(i) / (sample_rate * 0.004f));
++    const float release = 1.0f - static_cast<float>(i) / frames;
++    const float wave = std::sin(tau * frequency * time) +
++                       0.22f * std::sin(tau * frequency * 2.0f * time);
++    const s16 sample = static_cast<s16>(wave * attack * release * release * gain * 32767.0f);
++    samples[static_cast<std::size_t>(i) * 2] = static_cast<u8>(sample);
++    samples[static_cast<std::size_t>(i) * 2 + 1] = static_cast<u8>(sample >> 8);
++  }
++  stream->GetMixer()->PushSkylanderPortalSamples(samples.data(), frames);
++}
++
++void PlayFrontendFeedback(bool confirm)
++{
++  PlayFrontendTone(confirm ? 880.0f : 620.0f, confirm ? 85 : 45, confirm ? 0.14f : 0.09f);
++  FrontendInput::RequestRumble(confirm ? 16 : 5);
++}
++
++}
++
+ bool OnScreenUI::Initialize(u32 width, u32 height, float scale)
+ {
+   std::unique_lock<std::mutex> imgui_lock(m_imgui_mutex);
+@@ -77,12 +124,21 @@ bool OnScreenUI::Initialize(u32 width, u32 height, float scale)
+ 
+   // Font defaults
+   ImGuiIO& io = ImGui::GetIO();
++  io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard | ImGuiConfigFlags_NavEnableGamepad;
++  io.BackendFlags |= ImGuiBackendFlags_HasGamepad;
+   m_imgui_textures.clear();
+ 
+   // User supplied font
+   std::string file = File::GetUserPath(D_LOAD_IDX) + "OSD_Font.ttf";
+ 
+   bool font_exists = File::Exists(file);
++#ifdef _WIN32
++  if (!font_exists)
++  {
++    file = "C:/Windows/Fonts/segoeui.ttf";
++    font_exists = File::Exists(file);
++  }
++#endif
+   if (!font_exists)
+   {
+     // Default supplied font
+@@ -207,6 +263,7 @@ void OnScreenUI::BeginImGuiFrameUnlocked(u32 width, u32 height)
+       ImVec2(static_cast<float>(m_backbuffer_width), static_cast<float>(m_backbuffer_height));
+   io.DeltaTime = time_diff_secs;
+ 
++  UpdateFrontendMenu();
+   ImGui::NewFrame();
+ }
+ 
+@@ -236,7 +293,7 @@ void OnScreenUI::DrawImGui()
+   {
+     const ImDrawList* cmdlist = draw_data->CmdLists[i];
+     if (cmdlist->VtxBuffer.empty() || cmdlist->IdxBuffer.empty())
+-      return;
++      continue;
+ 
+     u32 base_vertex, base_index;
+     g_vertex_manager->UploadUtilityVertices(cmdlist->VtxBuffer.Data, sizeof(ImDrawVert),
+@@ -413,6 +470,902 @@ void OnScreenUI::DrawChallengesAndLeaderboards()
+ #endif  // USE_RETRO_ACHIEVEMENTS
+ }
+ 
++void OnScreenUI::DrawSettingsPanel()
++{
++  if (!m_show_settings.load(std::memory_order_relaxed))
++    return;
++
++  const ImVec2 display = ImGui::GetIO().DisplaySize;
++  const float scale = std::clamp(display.y / 900.0f, 0.72f, 1.35f);
++  const float margin = 64.0f * scale;
++  const float rail_width = 250.0f * scale;
++  ImDrawList* const backdrop = ImGui::GetBackgroundDrawList();
++  backdrop->AddRectFilledMultiColor(ImVec2(0, 0), display, IM_COL32(3, 8, 18, 220),
++                                    IM_COL32(4, 12, 28, 196), IM_COL32(4, 12, 28, 196),
++                                    IM_COL32(3, 8, 18, 220));
++  backdrop->AddRectFilled(ImVec2(margin + rail_width, 108.0f * scale),
++                          ImVec2(margin + rail_width + 1.0f, display.y - 72.0f * scale),
++                          IM_COL32(120, 205, 255, 55));
++
++  ImGui::SetNextWindowPos(ImVec2(0, 0));
++  ImGui::SetNextWindowSize(display);
++  ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(margin, 42.0f * scale));
++  ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(10.0f * scale, 11.0f * scale));
++  ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(12.0f * scale, 8.0f * scale));
++  ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 5.0f * scale);
++  ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0, 0, 0, 0));
++  ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0, 0, 0, 0));
++  ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4(0.08f, 0.14f, 0.24f, 0.78f));
++  ImGui::PushStyleColor(ImGuiCol_FrameBgHovered, ImVec4(0.12f, 0.25f, 0.39f, 0.90f));
++  ImGui::PushStyleColor(ImGuiCol_FrameBgActive, ImVec4(0.15f, 0.31f, 0.48f, 1.0f));
++  ImGui::PushStyleColor(ImGuiCol_Header, ImVec4(0.13f, 0.34f, 0.54f, 0.88f));
++  ImGui::PushStyleColor(ImGuiCol_HeaderHovered, ImVec4(0.20f, 0.48f, 0.70f, 0.95f));
++  ImGui::PushStyleColor(ImGuiCol_CheckMark, ImVec4(0.48f, 0.87f, 1.0f, 1.0f));
++  ImGui::PushStyleColor(ImGuiCol_SliderGrab, ImVec4(0.48f, 0.87f, 1.0f, 1.0f));
++  ImGui::Begin("GalaxyPCSettings", nullptr,
++               ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
++                   ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoBackground);
++  ImGui::SetWindowFontScale(1.25f * scale);
++
++  ImDrawList* const draw = ImGui::GetWindowDrawList();
++  draw->AddText(ImGui::GetFont(), 38.0f * scale, ImVec2(margin, 38.0f * scale),
++                IM_COL32(255, 255, 255, 255), "SETTINGS");
++  draw->AddText(ImGui::GetFont(), 14.0f * scale, ImVec2(margin, 82.0f * scale),
++                IM_COL32(151, 199, 229, 230), "SUPER MARIO GALAXY: STARLIGHT");
++  draw->AddText(ImGui::GetFont(), 14.0f * scale,
++                ImVec2(display.x - margin - 116.0f * scale, 52.0f * scale),
++                IM_COL32(205, 221, 235, 220), "RMGE01  /  USA");
++
++  static constexpr const char* categories[] = {"DISPLAY", "GRAPHICS", "PERFORMANCE", "MODS",
++                                                "CONTROLLER", "AUDIO", "SAVE DATA"};
++  ImGui::SetCursorScreenPos(ImVec2(margin, 132.0f * scale));
++  ImGui::PushItemFlag(ImGuiItemFlags_NoNav, true);
++  for (int i = 0; i < IM_ARRAYSIZE(categories); ++i)
++  {
++    const ImVec2 pos = ImGui::GetCursorScreenPos();
++    const ImVec2 size(rail_width - 28.0f * scale, 50.0f * scale);
++    const bool activated = ImGui::InvisibleButton(categories[i], size);
++    if (activated)
++    {
++      m_settings_category = i;
++      m_settings_content_navigation = false;
++    }
++    const bool selected = m_settings_category == i;
++    if (selected)
++    {
++      draw->AddRectFilledMultiColor(pos, ImVec2(pos.x + size.x, pos.y + size.y),
++                                    IM_COL32(96, 207, 255, 175), IM_COL32(85, 117, 255, 24),
++                                    IM_COL32(85, 117, 255, 24), IM_COL32(96, 207, 255, 175));
++      draw->AddRectFilled(pos, ImVec2(pos.x + 3.0f * scale, pos.y + size.y),
++                          IM_COL32(182, 239, 255, 255));
++    }
++    draw->AddText(ImGui::GetFont(), 19.0f * scale,
++                  ImVec2(pos.x + 16.0f * scale, pos.y + 13.0f * scale),
++                  selected ? IM_COL32(255, 255, 255, 255) : IM_COL32(187, 205, 222, 220),
++                  categories[i]);
++  }
++  ImGui::PopItemFlag();
++
++  const ImVec2 content_pos(margin + rail_width + 42.0f * scale, 126.0f * scale);
++  const ImVec2 content_size(display.x - content_pos.x - margin,
++                            display.y - content_pos.y - 78.0f * scale);
++  ImGui::SetCursorScreenPos(content_pos);
++  if (ImGui::BeginChild("SettingsContent", content_size, false))
++  {
++    ImGui::SetWindowFontScale(1.25f * scale);
++    if (m_settings_content_focus_pending)
++      ImGui::SetKeyboardFocusHere();
++    switch (m_settings_category)
++    {
++    case 0: DrawDisplaySettings(); break;
++    case 1: DrawGraphicsSettings(); break;
++    case 2: DrawPerformanceSettings(); break;
++    case 3: DrawModSettings(); break;
++    case 4: DrawControllerSettings(); break;
++    case 5: DrawAudioSettings(); break;
++    case 6: DrawSaveSettings(); break;
++    }
++    m_settings_content_focus_pending = false;
++  }
++  ImGui::EndChild();
++
++  draw->AddText(ImGui::GetFont(), 14.0f * scale,
++                ImVec2(margin, display.y - 45.0f * scale), IM_COL32(200, 218, 232, 220),
++                m_settings_from_frontend ?
++                    (m_settings_content_navigation ? "B  CATEGORIES" : "B  BACK") :
++                    "F2  CLOSE");
++  const char* saved = "Changes are saved automatically.";
++  const ImVec2 saved_size = ImGui::CalcTextSize(saved);
++  draw->AddText(ImGui::GetFont(), 14.0f * scale,
++                ImVec2(display.x - margin - saved_size.x, display.y - 45.0f * scale),
++                IM_COL32(157, 190, 214, 210), saved);
++
++  ImGui::SetWindowFontScale(1.0f);
++  ImGui::End();
++  ImGui::PopStyleColor(9);
++  ImGui::PopStyleVar(4);
++}
++
++void OnScreenUI::UpdateFrontendMenu()
++{
++  const u16 buttons = FrontendInput::GetButtons();
++  m_frontend_pressed = buttons & static_cast<u16>(~m_frontend_buttons);
++  m_frontend_buttons = buttons;
++
++  const bool a_down = (buttons & WiimoteEmu::Wiimote::BUTTON_A) != 0;
++  const bool b_down = (buttons & WiimoteEmu::Wiimote::BUTTON_B) != 0;
++  const bool up_down = (buttons & WiimoteEmu::Wiimote::PAD_UP) != 0;
++  const bool down_down = (buttons & WiimoteEmu::Wiimote::PAD_DOWN) != 0;
++  const bool left_down = (buttons & WiimoteEmu::Wiimote::PAD_LEFT) != 0;
++  const bool right_down = (buttons & WiimoteEmu::Wiimote::PAD_RIGHT) != 0;
++  const bool a_pressed = (m_frontend_pressed & WiimoteEmu::Wiimote::BUTTON_A) != 0;
++  const bool b_pressed = (m_frontend_pressed & WiimoteEmu::Wiimote::BUTTON_B) != 0;
++  const bool up_pressed = (m_frontend_pressed & WiimoteEmu::Wiimote::PAD_UP) != 0;
++  const bool down_pressed = (m_frontend_pressed & WiimoteEmu::Wiimote::PAD_DOWN) != 0;
++  const bool right_pressed = (m_frontend_pressed & WiimoteEmu::Wiimote::PAD_RIGHT) != 0;
++
++  if (!Config::Get(Config::MAIN_STATICRECOMP_CUSTOM_FRONTEND))
++  {
++    if (FrontendInput::IsFileSelectCaptured())
++      FrontendInput::ReleaseFileSelect();
++    m_frontend_finished = true;
++    m_show_frontend_menu = false;
++  }
++
++  if (m_frontend_play_transition)
++  {
++    ++m_frontend_transition_frames;
++    if (m_frontend_transition_frames == 8)
++      FrontendInput::ReleaseFileSelect();
++    if (m_frontend_transition_frames >= 26)
++    {
++      m_frontend_play_transition = false;
++      m_frontend_finished = true;
++      m_show_frontend_menu = false;
++    }
++    return;
++  }
++
++  if (!m_frontend_finished && !FrontendInput::IsFileSelectCaptured())
++  {
++    const u16 title_buttons = WiimoteEmu::Wiimote::BUTTON_A | WiimoteEmu::Wiimote::BUTTON_B;
++    if (!m_frontend_title_confirmed && (buttons & title_buttons) == title_buttons)
++    {
++      m_frontend_title_confirmed = true;
++      FrontendInput::ConfirmTitle();
++      m_frontend_transition_frames = 0;
++    }
++    if (m_frontend_title_confirmed && ++m_frontend_transition_frames >= 180)
++      FrontendInput::CaptureFileSelect();
++  }
++
++  if (m_frontend_finished && !m_settings_from_frontend)
++  {
++    m_show_frontend_menu = false;
++    m_frontend_confirm_exit = false;
++    return;
++  }
++
++  if (!m_frontend_finished && FrontendInput::IsFileSelectReady() &&
++      !m_show_frontend_menu && !m_show_settings)
++  {
++    m_show_frontend_menu = true;
++    m_frontend_selection = 0;
++    m_frontend_confirm_exit = false;
++    m_frontend_accept_input = false;
++  }
++
++  if (!a_down && !b_down)
++    m_frontend_accept_input = true;
++
++  if (m_settings_from_frontend && m_frontend_accept_input && b_pressed)
++  {
++    PlayFrontendFeedback(false);
++    if (m_settings_content_navigation)
++    {
++      m_settings_content_navigation = false;
++    }
++    else
++    {
++      m_show_settings = false;
++      m_settings_from_frontend = false;
++      m_show_frontend_menu = true;
++    }
++    m_frontend_accept_input = false;
++  }
++
++  if (m_settings_from_frontend && m_frontend_accept_input &&
++      !m_settings_content_navigation && !b_pressed)
++  {
++    if (up_pressed)
++    {
++      m_settings_category = (m_settings_category + 6) % 7;
++      PlayFrontendFeedback(false);
++    }
++    else if (down_pressed)
++    {
++      m_settings_category = (m_settings_category + 1) % 7;
++      PlayFrontendFeedback(false);
++    }
++    else if (a_pressed || right_pressed)
++    {
++      m_settings_content_navigation = true;
++      m_settings_content_focus_pending = true;
++      PlayFrontendFeedback(true);
++      m_frontend_accept_input = false;
++    }
++  }
++
++  const bool settings_nav = m_show_settings.load(std::memory_order_relaxed) &&
++                            m_settings_content_navigation && m_frontend_accept_input && !b_pressed;
++  ImGuiIO& io = ImGui::GetIO();
++  io.AddKeyEvent(ImGuiKey_GamepadFaceDown, settings_nav && a_down);
++  io.AddKeyEvent(ImGuiKey_GamepadDpadUp, settings_nav && up_down);
++  io.AddKeyEvent(ImGuiKey_GamepadDpadDown, settings_nav && down_down);
++  io.AddKeyEvent(ImGuiKey_GamepadDpadLeft, settings_nav && left_down);
++  io.AddKeyEvent(ImGuiKey_GamepadDpadRight, settings_nav && right_down);
++
++  if (settings_nav &&
++      (m_frontend_pressed & (WiimoteEmu::Wiimote::PAD_UP | WiimoteEmu::Wiimote::PAD_DOWN |
++                             WiimoteEmu::Wiimote::PAD_LEFT | WiimoteEmu::Wiimote::PAD_RIGHT)))
++  {
++    PlayFrontendFeedback(false);
++  }
++  if (settings_nav &&
++      (m_frontend_pressed & WiimoteEmu::Wiimote::BUTTON_A) != 0)
++  {
++    PlayFrontendFeedback(true);
++  }
++}
++
++void OnScreenUI::DrawFrontendMenu()
++{
++  if (!m_show_frontend_menu || m_show_settings.load(std::memory_order_relaxed))
++    return;
++
++  const ImVec2 display = ImGui::GetIO().DisplaySize;
++  const bool a_pressed = (m_frontend_pressed & WiimoteEmu::Wiimote::BUTTON_A) != 0;
++  const bool b_pressed = (m_frontend_pressed & WiimoteEmu::Wiimote::BUTTON_B) != 0;
++  const bool up_pressed = (m_frontend_pressed & WiimoteEmu::Wiimote::PAD_UP) != 0;
++  const bool down_pressed = (m_frontend_pressed & WiimoteEmu::Wiimote::PAD_DOWN) != 0;
++  const float scale = std::clamp(display.y / 900.0f, 0.72f, 1.35f);
++  const float menu_width = 390.0f * scale;
++  const float right_margin = 66.0f * scale;
++  const float menu_x = display.x - menu_width - right_margin;
++  const float menu_y = m_frontend_confirm_exit ? 270.0f * scale : 250.0f * scale;
++  ImDrawList* const background = ImGui::GetBackgroundDrawList();
++
++  const auto draw_play_transition = [&] {
++    if (!m_frontend_play_transition)
++      return;
++    const int frame = m_frontend_transition_frames;
++    const float opacity = frame < 8 ? static_cast<float>(frame) / 8.0f :
++                                      1.0f - static_cast<float>(frame - 8) / 18.0f;
++    background->AddRectFilled(ImVec2(0, 0), display,
++                              IM_COL32(220, 242, 255,
++                                       static_cast<int>(255.0f * std::clamp(opacity, 0.0f, 1.0f))));
++  };
++
++  if (m_frontend_play_transition && m_frontend_transition_frames >= 8)
++  {
++    draw_play_transition();
++    return;
++  }
++
++  background->AddRectFilledMultiColor(
++      ImVec2(0, 0), display, IM_COL32(3, 7, 16, 178), IM_COL32(3, 8, 18, 238),
++      IM_COL32(3, 8, 18, 238), IM_COL32(3, 7, 16, 178));
++  background->AddRectFilledMultiColor(ImVec2(display.x * 0.48f, 0), display,
++                                      IM_COL32(3, 8, 18, 0), IM_COL32(2, 6, 14, 218),
++                                      IM_COL32(2, 6, 14, 218), IM_COL32(3, 8, 18, 0));
++
++  ImGui::SetNextWindowPos(ImVec2(0, 0));
++  ImGui::SetNextWindowSize(display);
++  ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
++  ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(0, 12.0f * scale));
++  ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0, 0, 0, 0));
++  ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0, 0, 0, 0));
++  ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0, 0, 0, 0));
++  ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0, 0, 0, 0));
++  ImGui::Begin("GalaxyPCMainMenu", nullptr,
++               ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
++                   ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoBackground);
++
++  ImDrawList* const draw = ImGui::GetWindowDrawList();
++  draw->AddText(ImGui::GetFont(), 14.0f * scale,
++                ImVec2(display.x - right_margin - 128.0f * scale, 44.0f * scale),
++                IM_COL32(219, 231, 242, 235), "STARLIGHT  /  USA");
++  draw->AddText(ImGui::GetFont(), 13.0f * scale,
++                ImVec2(54.0f * scale, display.y - 48.0f * scale),
++                IM_COL32(191, 216, 233, 215), "SUPER MARIO GALAXY  /  RMGE01");
++
++  auto draw_item = [&](const char* id, const char* label, const char* detail, int index) {
++    const ImVec2 cursor = ImGui::GetCursorScreenPos();
++    const ImVec2 size(menu_width, 66.0f * scale);
++    ImGui::InvisibleButton(id, size);
++    if (ImGui::IsItemHovered())
++      m_frontend_selection = index;
++    const bool selected = m_frontend_selection == index;
++    if (selected)
++    {
++      draw->AddRectFilledMultiColor(cursor, ImVec2(cursor.x + size.x, cursor.y + size.y),
++                                    IM_COL32(104, 210, 255, 30), IM_COL32(225, 247, 255, 245),
++                                    IM_COL32(173, 219, 255, 235), IM_COL32(104, 210, 255, 30));
++      draw->AddRectFilled(ImVec2(cursor.x + size.x - 4.0f * scale, cursor.y),
++                          ImVec2(cursor.x + size.x, cursor.y + size.y),
++                          IM_COL32(224, 251, 255, 255));
++    }
++    const ImVec2 label_size =
++        ImGui::GetFont()->CalcTextSizeA(29.0f * scale, display.x, 0.0f, label);
++    draw->AddText(ImGui::GetFont(), 29.0f * scale,
++                  ImVec2(cursor.x + size.x - label_size.x - 30.0f * scale,
++                         cursor.y + 11.0f * scale),
++                  selected ? IM_COL32(8, 20, 38, 255) : IM_COL32(255, 255, 255, 245), label);
++    return m_frontend_accept_input && ImGui::IsItemClicked();
++  };
++
++  ImGui::SetCursorScreenPos(ImVec2(menu_x, menu_y));
++  bool activate = false;
++  if (m_frontend_confirm_exit)
++  {
++    draw->AddText(ImGui::GetFont(), 24.0f * scale, ImVec2(menu_x + 24.0f * scale,
++                                                         menu_y - 82.0f * scale),
++                  IM_COL32(255, 255, 255, 255), "EXIT THE GAME?");
++    draw->AddText(ImGui::GetFont(), 13.0f * scale, ImVec2(menu_x + 24.0f * scale,
++                                                         menu_y - 48.0f * scale),
++                  IM_COL32(187, 207, 224, 225), "Your save data is already safe.");
++    if (m_frontend_accept_input && (up_pressed || down_pressed))
++    {
++      m_frontend_selection = m_frontend_selection == 0 ? 1 : 0;
++      PlayFrontendFeedback(false);
++    }
++    ImGui::SetCursorScreenPos(ImVec2(menu_x, menu_y));
++    const bool exit_clicked = draw_item("##confirm_exit", "EXIT", "Close the game", 0);
++    ImGui::SetCursorScreenPos(ImVec2(menu_x, menu_y + 78.0f * scale));
++    const bool cancel_clicked = draw_item("##cancel_exit", "CANCEL", "Return to the menu", 1);
++    activate = m_frontend_accept_input && a_pressed;
++    if (exit_clicked || (activate && m_frontend_selection == 0))
++    {
++      PlayFrontendFeedback(true);
++      Core::QueueHostJob(&Core::Stop);
++    }
++    else if (cancel_clicked || b_pressed || (activate && m_frontend_selection == 1))
++    {
++      PlayFrontendFeedback(false);
++      m_frontend_confirm_exit = false;
++      m_frontend_selection = 2;
++      m_frontend_accept_input = false;
++    }
++  }
++  else
++  {
++    if (m_frontend_accept_input && up_pressed)
++    {
++      m_frontend_selection = (m_frontend_selection + 2) % 3;
++      PlayFrontendFeedback(false);
++    }
++    if (m_frontend_accept_input && down_pressed)
++    {
++      m_frontend_selection = (m_frontend_selection + 1) % 3;
++      PlayFrontendFeedback(false);
++    }
++
++    ImGui::SetCursorScreenPos(ImVec2(menu_x, menu_y));
++    const bool play_clicked = draw_item("##play", "PLAY", "Continue to the file select", 0);
++    ImGui::SetCursorScreenPos(ImVec2(menu_x, menu_y + 78.0f * scale));
++    const bool settings_clicked = draw_item("##settings", "SETTINGS", "Video, audio and controls", 1);
++    ImGui::SetCursorScreenPos(ImVec2(menu_x, menu_y + 156.0f * scale));
++    const bool exit_clicked = draw_item("##exit", "QUIT", "Return to the desktop", 2);
++    activate = m_frontend_accept_input && a_pressed;
++
++    if (play_clicked || (activate && m_frontend_selection == 0))
++    {
++      PlayFrontendFeedback(true);
++      m_frontend_play_transition = true;
++      m_frontend_transition_frames = 0;
++      m_frontend_accept_input = false;
++    }
++    else if (settings_clicked || (activate && m_frontend_selection == 1))
++    {
++      PlayFrontendFeedback(true);
++      m_show_frontend_menu = false;
++      m_show_settings = true;
++      m_settings_from_frontend = true;
++      m_settings_content_navigation = false;
++      m_settings_content_focus_pending = false;
++      m_frontend_accept_input = false;
++    }
++    else if (exit_clicked || (activate && m_frontend_selection == 2))
++    {
++      PlayFrontendFeedback(true);
++      m_frontend_confirm_exit = true;
++      m_frontend_selection = 1;
++      m_frontend_accept_input = false;
++    }
++  }
++
++  draw->AddText(ImGui::GetFont(), 13.0f * scale,
++                ImVec2(display.x - right_margin - 218.0f * scale,
++                       display.y - 48.0f * scale),
++                IM_COL32(207, 224, 237, 220), "D-PAD  NAVIGATE     A  SELECT");
++  draw_play_transition();
++  ImGui::End();
++  ImGui::PopStyleColor(4);
++  ImGui::PopStyleVar(2);
++}
++
++void OnScreenUI::DrawDisplaySettings()
++{
++  ImGui::TextUnformatted("Output");
++  ImGui::TextDisabled("Resolution and presentation changes apply while the game is running.");
++  ImGui::Spacing();
++
++  static const char* const resolutions[] = {"Auto (window size)", "Native (640 x 528)",
++                                            "2x (1280 x 1056)",   "3x (1920 x 1584)",
++                                            "4x (2560 x 2112)",   "5x (3200 x 2640)",
++                                            "6x (3840 x 3168)"};
++  int scale = Config::Get(Config::GFX_EFB_SCALE);
++  if (scale < 0 || scale >= IM_ARRAYSIZE(resolutions))
++    scale = 0;
++  ImGui::SetNextItemWidth(310.0f);
++  if (ImGui::Combo("Internal resolution", &scale, resolutions, IM_ARRAYSIZE(resolutions)))
++    Config::SetBaseOrCurrent(Config::GFX_EFB_SCALE, scale);
++  static const char* const aspects[] = {"Auto", "Stretch", "4:3", "16:9", "21:9 ultrawide",
++                                        "32:9 super ultrawide"};
++  const AspectMode current_aspect = Config::Get(Config::GFX_ASPECT_RATIO);
++  int aspect = 2;
++  if (current_aspect == AspectMode::Auto)
++    aspect = 0;
++  else if (current_aspect == AspectMode::Stretch)
++    aspect = 1;
++  else if (current_aspect == AspectMode::ForceStandard)
++    aspect = 2;
++  else if (current_aspect == AspectMode::ForceWide)
++    aspect = 3;
++  else if (current_aspect == AspectMode::Custom)
++  {
++    const int width = Config::Get(Config::GFX_CUSTOM_ASPECT_RATIO_WIDTH);
++    aspect = width >= 32 ? 5 : 4;
++  }
++  ImGui::SetNextItemWidth(310.0f);
++  if (ImGui::Combo("Aspect ratio", &aspect, aspects, IM_ARRAYSIZE(aspects)))
++  {
++    if (aspect == 0)
++      Config::SetBaseOrCurrent(Config::GFX_ASPECT_RATIO, AspectMode::Auto);
++    else if (aspect == 1)
++      Config::SetBaseOrCurrent(Config::GFX_ASPECT_RATIO, AspectMode::Stretch);
++    else if (aspect == 2)
++      Config::SetBaseOrCurrent(Config::GFX_ASPECT_RATIO, AspectMode::ForceStandard);
++    else if (aspect == 3)
++      Config::SetBaseOrCurrent(Config::GFX_ASPECT_RATIO, AspectMode::ForceWide);
++    else
++    {
++      Config::SetBaseOrCurrent(Config::GFX_ASPECT_RATIO, AspectMode::Custom);
++      Config::SetBaseOrCurrent(Config::GFX_CUSTOM_ASPECT_RATIO_WIDTH, aspect == 4 ? 21 : 32);
++      Config::SetBaseOrCurrent(Config::GFX_CUSTOM_ASPECT_RATIO_HEIGHT, 9);
++      Config::SetBaseOrCurrent(Config::GFX_WIDESCREEN_HACK, true);
++    }
++  }
++
++  bool fullscreen = Config::Get(Config::MAIN_FULLSCREEN);
++  if (ImGui::Checkbox("Borderless fullscreen on next launch", &fullscreen))
++    Config::SetBaseOrCurrent(Config::MAIN_FULLSCREEN, fullscreen);
++  ImGui::SameLine();
++  ImGui::TextDisabled("(F11 / Alt+Enter now)");
++
++  bool vsync = Config::Get(Config::GFX_VSYNC);
++  if (ImGui::Checkbox("Vertical sync", &vsync))
++    Config::SetBaseOrCurrent(Config::GFX_VSYNC, vsync);
++
++  bool show_metrics = Config::Get(Config::GFX_SHOW_FPS);
++  if (ImGui::Checkbox("Performance overlay", &show_metrics))
++  {
++    Config::SetBaseOrCurrent(Config::GFX_SHOW_FPS, show_metrics);
++    Config::SetBaseOrCurrent(Config::GFX_SHOW_SPEED, show_metrics);
++  }
++}
++
++void OnScreenUI::DrawGraphicsSettings()
++{
++  ImGui::TextUnformatted("Image quality");
++  ImGui::TextDisabled("Features here preserve the original rendering unless explicitly enabled.");
++  ImGui::Spacing();
++
++  bool widescreen = Config::Get(Config::GFX_WIDESCREEN_HACK);
++  if (ImGui::Checkbox("Experimental widescreen expansion", &widescreen))
++    Config::SetBaseOrCurrent(Config::GFX_WIDESCREEN_HACK, widescreen);
++  if (ImGui::IsItemHovered())
++    ImGui::SetTooltip("Expands 3D geometry beyond the original view; some scenes may show artifacts.");
++
++  static const char* const anti_aliasing[] = {"Off", "2x MSAA", "4x MSAA", "8x MSAA"};
++  const u32 current_msaa = Config::Get(Config::GFX_MSAA);
++  int msaa_index = current_msaa >= 8 ? 3 : current_msaa >= 4 ? 2 : current_msaa >= 2 ? 1 : 0;
++  ImGui::SetNextItemWidth(310.0f);
++  if (ImGui::Combo("Anti-aliasing", &msaa_index, anti_aliasing, IM_ARRAYSIZE(anti_aliasing)))
++  {
++    Config::SetBaseOrCurrent(Config::GFX_MSAA, 1u << msaa_index);
++    if (msaa_index != 0)
++      Config::SetBaseOrCurrent(Config::MAIN_STATICRECOMP_INTERPOLATION, false);
++  }
++
++  bool ssaa = Config::Get(Config::GFX_SSAA);
++  ImGui::BeginDisabled(msaa_index == 0);
++  if (ImGui::Checkbox("Supersample anti-aliasing", &ssaa))
++  {
++    Config::SetBaseOrCurrent(Config::GFX_SSAA, ssaa);
++    if (ssaa)
++      Config::SetBaseOrCurrent(Config::MAIN_STATICRECOMP_INTERPOLATION, false);
++  }
++  ImGui::EndDisabled();
++
++  bool true_color = Config::Get(Config::GFX_ENHANCE_FORCE_TRUE_COLOR);
++  if (ImGui::Checkbox("True-color rendering", &true_color))
++    Config::SetBaseOrCurrent(Config::GFX_ENHANCE_FORCE_TRUE_COLOR, true_color);
++
++  bool disable_copy_filter = Config::Get(Config::GFX_ENHANCE_DISABLE_COPY_FILTER);
++  if (ImGui::Checkbox("Disable original blur filter", &disable_copy_filter))
++    Config::SetBaseOrCurrent(Config::GFX_ENHANCE_DISABLE_COPY_FILTER, disable_copy_filter);
++  if (ImGui::IsItemHovered())
++    ImGui::SetTooltip("Produces a sharper image by removing the Wii copy filter.");
++
++  bool disable_fog = Config::Get(Config::GFX_DISABLE_FOG);
++  if (ImGui::Checkbox("Disable fog", &disable_fog))
++    Config::SetBaseOrCurrent(Config::GFX_DISABLE_FOG, disable_fog);
++  if (ImGui::IsItemHovered())
++    ImGui::SetTooltip("Host graphics mod. Some galaxies use fog as part of their intended look.");
++
++  bool hires = Config::Get(Config::GFX_HIRES_TEXTURES);
++  if (ImGui::Checkbox("Load custom HD textures", &hires))
++    Config::SetBaseOrCurrent(Config::GFX_HIRES_TEXTURES, hires);
++
++  bool cache_hires = Config::Get(Config::GFX_CACHE_HIRES_TEXTURES);
++  ImGui::BeginDisabled(!hires);
++  if (ImGui::Checkbox("Preload HD textures into memory", &cache_hires))
++    Config::SetBaseOrCurrent(Config::GFX_CACHE_HIRES_TEXTURES, cache_hires);
++  ImGui::EndDisabled();
++  if (ImGui::IsItemHovered())
++    ImGui::SetTooltip("Reduces texture pop-in but can use a large amount of RAM.");
++
++  static const char* const filtering[] = {"Game controlled", "Nearest", "Linear"};
++  int texture_filtering =
++      static_cast<int>(Config::Get(Config::GFX_ENHANCE_FORCE_TEXTURE_FILTERING));
++  if (texture_filtering < 0 || texture_filtering >= IM_ARRAYSIZE(filtering))
++    texture_filtering = 0;
++  ImGui::SetNextItemWidth(310.0f);
++  if (ImGui::Combo("Texture filtering", &texture_filtering, filtering,
++                   IM_ARRAYSIZE(filtering)))
++  {
++    Config::SetBaseOrCurrent(Config::GFX_ENHANCE_FORCE_TEXTURE_FILTERING,
++                             static_cast<TextureFilteringMode>(texture_filtering));
++  }
++
++  static const char* const anisotropy[] = {"Game controlled", "1x", "2x", "4x", "8x", "16x"};
++  int anisotropy_index =
++      static_cast<int>(Config::Get(Config::GFX_ENHANCE_MAX_ANISOTROPY)) + 1;
++  if (anisotropy_index < 0 || anisotropy_index >= IM_ARRAYSIZE(anisotropy))
++    anisotropy_index = 0;
++  ImGui::SetNextItemWidth(310.0f);
++  if (ImGui::Combo("Anisotropic filtering", &anisotropy_index, anisotropy,
++                   IM_ARRAYSIZE(anisotropy)))
++  {
++    Config::SetBaseOrCurrent(Config::GFX_ENHANCE_MAX_ANISOTROPY,
++                             static_cast<AnisotropicFilteringMode>(anisotropy_index - 1));
++  }
++
++#ifdef _WIN32
++  if (ImGui::Button("Open HD texture folder"))
++  {
++    std::string texture_path = File::GetUserPath(D_LOAD_IDX) + "Textures/RMGE01/";
++    File::CreateFullPath(texture_path);
++    for (char& c : texture_path)
++      if (c == '/')
++        c = '\\';
++    std::system(("explorer \"" + texture_path + "\"").c_str());
++  }
++#endif
++}
++
++void OnScreenUI::DrawModSettings()
++{
++  ImGui::TextUnformatted("Game-side mods");
++  ImGui::TextDisabled("These hooks alter RMGE01 game flow or actor presentation.");
++  ImGui::Spacing();
++
++  bool custom_frontend = Config::Get(Config::MAIN_STATICRECOMP_CUSTOM_FRONTEND);
++  if (ImGui::Checkbox("PC menu before file select", &custom_frontend))
++    Config::SetBaseOrCurrent(Config::MAIN_STATICRECOMP_CUSTOM_FRONTEND, custom_frontend);
++
++  bool hide_actors = Config::Get(Config::MAIN_STATICRECOMP_HIDE_FILE_SELECT_ACTORS);
++  if (ImGui::Checkbox("Hide native file-select interface behind PC menu", &hide_actors))
++    Config::SetBaseOrCurrent(Config::MAIN_STATICRECOMP_HIDE_FILE_SELECT_ACTORS, hide_actors);
++  if (ImGui::IsItemHovered())
++    ImGui::SetTooltip("Keeps the rocks, portraits, numbers, prompts and pointer hidden until PLAY.");
++
++  ImGui::Separator();
++  ImGui::TextUnformatted("Host-side mods");
++  ImGui::TextDisabled("These affect the PC renderer without changing simulation.");
++  ImGui::Spacing();
++
++  bool smooth_presentation = Config::Get(Config::MAIN_SMOOTH_EARLY_PRESENTATION);
++  if (ImGui::Checkbox("Smooth 60 Hz frame pacing", &smooth_presentation))
++    Config::SetBaseOrCurrent(Config::MAIN_SMOOTH_EARLY_PRESENTATION, smooth_presentation);
++
++  bool skip_duplicates = Config::Get(Config::GFX_HACK_SKIP_DUPLICATE_XFBS);
++  if (ImGui::Checkbox("Skip duplicate video frames", &skip_duplicates))
++    Config::SetBaseOrCurrent(Config::GFX_HACK_SKIP_DUPLICATE_XFBS, skip_duplicates);
++
++  ImGui::Separator();
++  ImGui::TextUnformatted("High-refresh presentation");
++  bool interpolation = Config::Get(Config::MAIN_STATICRECOMP_INTERPOLATION);
++  if (ImGui::Checkbox("Inter-frame interpolation", &interpolation))
++  {
++    Config::SetBaseOrCurrent(Config::MAIN_STATICRECOMP_INTERPOLATION, interpolation);
++    if (interpolation)
++    {
++      Config::SetBaseOrCurrent(Config::GFX_VSYNC, false);
++      Config::SetBaseOrCurrent(Config::GFX_MSAA, 1u);
++      Config::SetBaseOrCurrent(Config::GFX_SSAA, false);
++    }
++  }
++
++  static const char* const interpolation_rates[] = {"90 FPS", "120 FPS", "144 FPS",
++                                                    "165 FPS", "240 FPS", "360 FPS"};
++  static constexpr u32 interpolation_rate_values[] = {90, 120, 144, 165, 240, 360};
++  u32 rate = Config::Get(Config::MAIN_STATICRECOMP_INTERPOLATION_RATE);
++  int rate_index = 1;
++  for (int i = 0; i < IM_ARRAYSIZE(interpolation_rate_values); ++i)
++  {
++    if (rate == interpolation_rate_values[i])
++      rate_index = i;
++  }
++  ImGui::BeginDisabled(!interpolation);
++  ImGui::SetNextItemWidth(220.0f);
++  if (ImGui::Combo("Presentation rate", &rate_index, interpolation_rates,
++                   IM_ARRAYSIZE(interpolation_rates)))
++  {
++    Config::SetBaseOrCurrent(Config::MAIN_STATICRECOMP_INTERPOLATION_RATE,
++                             interpolation_rate_values[rate_index]);
++  }
++  ImGui::EndDisabled();
++  ImGui::TextWrapped("Generates paced temporal blends between consecutive 60 Hz game frames. The "
++                     "effective output is limited to the active display refresh so unsupported "
++                     "rates cannot consume GPU time or cause flashing. Gameplay, input and audio "
++                     "remain synchronized to the original simulation rate.");
++}
++
++void OnScreenUI::DrawPerformanceSettings()
++{
++  ImGui::TextUnformatted("Performance profile");
++  ImGui::TextDisabled("These presets change GPU cost, not the speed of the game simulation.");
++  ImGui::Spacing();
++
++  if (ImGui::Button("Performance", ImVec2(150.0f, 34.0f)))
++  {
++    Config::SetBaseOrCurrent(Config::GFX_EFB_SCALE, 1);
++    Config::SetBaseOrCurrent(Config::GFX_MSAA, 1u);
++    Config::SetBaseOrCurrent(Config::GFX_SSAA, false);
++    Config::SetBaseOrCurrent(Config::GFX_HIRES_TEXTURES, false);
++    Config::SetBaseOrCurrent(Config::GFX_CACHE_HIRES_TEXTURES, false);
++    Config::SetBaseOrCurrent(Config::GFX_SHADER_COMPILATION_MODE,
++                              ShaderCompilationMode::AsynchronousUberShaders);
++    Config::SetBaseOrCurrent(Config::GFX_BACKEND_MULTITHREADING, true);
++  }
++  ImGui::SameLine();
++  if (ImGui::Button("Balanced", ImVec2(150.0f, 34.0f)))
++  {
++    Config::SetBaseOrCurrent(Config::GFX_EFB_SCALE, 2);
++    Config::SetBaseOrCurrent(Config::GFX_MSAA, 1u);
++    Config::SetBaseOrCurrent(Config::GFX_SSAA, false);
++    Config::SetBaseOrCurrent(Config::GFX_CACHE_HIRES_TEXTURES, false);
++    Config::SetBaseOrCurrent(Config::GFX_SHADER_COMPILATION_MODE,
++                             ShaderCompilationMode::AsynchronousUberShaders);
++    Config::SetBaseOrCurrent(Config::GFX_BACKEND_MULTITHREADING, true);
++  }
++  ImGui::SameLine();
++  if (ImGui::Button("High quality", ImVec2(150.0f, 34.0f)))
++  {
++    Config::SetBaseOrCurrent(Config::GFX_EFB_SCALE, 3);
++    Config::SetBaseOrCurrent(Config::GFX_SHADER_COMPILATION_MODE,
++                             ShaderCompilationMode::AsynchronousUberShaders);
++    Config::SetBaseOrCurrent(Config::GFX_BACKEND_MULTITHREADING, true);
++  }
++
++  static const char* const shader_modes[] = {"Specialized (may stutter)",
++                                             "Exclusive ubershaders",
++                                             "Hybrid ubershaders (recommended)",
++                                             "Skip rendering while compiling"};
++  int shader_mode = static_cast<int>(Config::Get(Config::GFX_SHADER_COMPILATION_MODE));
++  if (shader_mode < 0 || shader_mode >= IM_ARRAYSIZE(shader_modes))
++    shader_mode = 2;
++  ImGui::SetNextItemWidth(310.0f);
++  if (ImGui::Combo("Shader compilation", &shader_mode, shader_modes,
++                   IM_ARRAYSIZE(shader_modes)))
++  {
++    Config::SetBaseOrCurrent(Config::GFX_SHADER_COMPILATION_MODE,
++                             static_cast<ShaderCompilationMode>(shader_mode));
++  }
++
++  bool backend_mt = Config::Get(Config::GFX_BACKEND_MULTITHREADING);
++  if (ImGui::Checkbox("Multithreaded graphics backend", &backend_mt))
++    Config::SetBaseOrCurrent(Config::GFX_BACKEND_MULTITHREADING, backend_mt);
++
++  bool hybrid = Config::Get(Config::MAIN_STATICRECOMP_HYBRID_PERFORMANCE);
++  if (ImGui::Checkbox("Stable gameplay core after PLAY (recommended)", &hybrid))
++    Config::SetBaseOrCurrent(Config::MAIN_STATICRECOMP_HYBRID_PERFORMANCE, hybrid);
++  if (ImGui::IsItemHovered())
++  {
++    ImGui::SetTooltip("Keeps the recompiled boot and PC frontend, then uses the optimized CPU "
++                      "core for stable gameplay. Disable this for pure static-recomp testing.");
++  }
++
++  const float simulation_speed = Config::Get(Config::MAIN_EMULATION_SPEED);
++  ImGui::Separator();
++  ImGui::TextUnformatted("Game simulation");
++  if (simulation_speed == 1.0f)
++    ImGui::TextColored(ImVec4(0.40f, 0.86f, 0.56f, 1.00f), "100%% - original timing");
++  else
++  {
++    ImGui::TextColored(ImVec4(1.00f, 0.65f, 0.25f, 1.00f),
++                       "Non-standard speed: %.2fx", simulation_speed);
++    ImGui::SameLine();
++    if (ImGui::SmallButton("Restore 100%"))
++      Config::SetBaseOrCurrent(Config::MAIN_EMULATION_SPEED, 1.0f);
++  }
++  ImGui::TextWrapped("The recompiled PPC game remains a 60 Hz simulation. High-refresh output "
++                     "requires presentation interpolation; removing the speed limit would make "
++                     "gameplay and audio run faster.");
++}
++
++void OnScreenUI::DrawControllerSettings()
++{
++  ImGui::TextUnformatted("Galaxy controller profile");
++  ImGui::TextDisabled("Wii Remote + Nunchuk behavior is translated to a standard gamepad.");
++  ImGui::Spacing();
++
++  if (ImGui::BeginTable("ControllerMap", 2,
++                        ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerH |
++                            ImGuiTableFlags_SizingStretchProp))
++  {
++    const char* const bindings[][2] = {{"Move", "Left stick"},
++                                       {"Star pointer", "Right stick or controller motion"},
++                                       {"Jump / confirm", "A / Cross"},
++                                       {"Crouch / back", "B / Circle or right trigger"},
++                                       {"Spin / shake", "X / Square"},
++                                       {"Camera reset (C)", "Left shoulder"},
++                                       {"Crouch (Z)", "Left trigger"},
++                                       {"Pause", "Menu / Options"}};
++    for (const auto& binding : bindings)
++    {
++      ImGui::TableNextRow();
++      ImGui::TableSetColumnIndex(0);
++      ImGui::TextUnformatted(binding[0]);
++      ImGui::TableSetColumnIndex(1);
++      ImGui::TextUnformatted(binding[1]);
++    }
++    ImGui::EndTable();
++  }
++
++  ImGui::Spacing();
++  ImGui::Separator();
++  ImGui::TextUnformatted("PC profile tuning");
++  ImGui::TextDisabled("Changes are written to the controller profile on the next launch.");
++
++  static constexpr const char* layouts[] = {"PC / Xbox / PlayStation",
++                                             "Nintendo face buttons"};
++  int layout = Config::Get(Config::MAIN_STATICRECOMP_CONTROLLER_LAYOUT) == 1 ? 1 : 0;
++  ImGui::SetNextItemWidth(310.0f);
++  if (ImGui::Combo("Face-button layout", &layout, layouts, IM_ARRAYSIZE(layouts)))
++    Config::SetBaseOrCurrent(Config::MAIN_STATICRECOMP_CONTROLLER_LAYOUT,
++                             static_cast<u32>(layout));
++
++  float movement_deadzone = Config::Get(Config::MAIN_STATICRECOMP_MOVE_DEADZONE);
++  if (ImGui::SliderFloat("Movement deadzone", &movement_deadzone, 0.0f, 35.0f, "%.0f%%"))
++    Config::SetBaseOrCurrent(Config::MAIN_STATICRECOMP_MOVE_DEADZONE, movement_deadzone);
++
++  float pointer_deadzone = Config::Get(Config::MAIN_STATICRECOMP_POINTER_DEADZONE);
++  if (ImGui::SliderFloat("Pointer deadzone", &pointer_deadzone, 0.0f, 35.0f, "%.0f%%"))
++    Config::SetBaseOrCurrent(Config::MAIN_STATICRECOMP_POINTER_DEADZONE, pointer_deadzone);
++
++  float pointer_sensitivity = Config::Get(Config::MAIN_STATICRECOMP_POINTER_SENSITIVITY);
++  if (ImGui::SliderFloat("Pointer speed", &pointer_sensitivity, 0.25f, 3.0f, "%.2fx"))
++    Config::SetBaseOrCurrent(Config::MAIN_STATICRECOMP_POINTER_SENSITIVITY,
++                             pointer_sensitivity);
++
++  bool gyro_enabled = Config::Get(Config::MAIN_STATICRECOMP_GYRO_ENABLED);
++  if (ImGui::Checkbox("DualShock / DualSense motion", &gyro_enabled))
++    Config::SetBaseOrCurrent(Config::MAIN_STATICRECOMP_GYRO_ENABLED, gyro_enabled);
++  ImGui::BeginDisabled(!gyro_enabled);
++  float gyro_deadzone = Config::Get(Config::MAIN_STATICRECOMP_GYRO_DEADZONE);
++  if (ImGui::SliderFloat("Gyro deadzone", &gyro_deadzone, 0.0f, 20.0f, "%.1f deg/s"))
++    Config::SetBaseOrCurrent(Config::MAIN_STATICRECOMP_GYRO_DEADZONE, gyro_deadzone);
++  int gyro_calibration = static_cast<int>(
++      Config::Get(Config::MAIN_STATICRECOMP_GYRO_CALIBRATION_PERIOD));
++  if (ImGui::SliderInt("Gyro calibration", &gyro_calibration, 0, 10, "%d s"))
++  {
++    Config::SetBaseOrCurrent(Config::MAIN_STATICRECOMP_GYRO_CALIBRATION_PERIOD,
++                             static_cast<u32>(gyro_calibration));
++  }
++  ImGui::EndDisabled();
++
++  ImGui::Spacing();
++  ImGui::TextWrapped("Xbox, DualShock and DualSense controllers use the same profile. When SDL "
++                     "exposes gyro and accelerometer sensors, motion is passed through alongside "
++                     "the right-stick pointer fallback. Press the right stick to recenter.");
++}
++
++void OnScreenUI::DrawAudioSettings()
++{
++  ImGui::TextUnformatted("Audio output");
++  ImGui::TextDisabled("Restart the game after changing the output mode.");
++  ImGui::Spacing();
++
++  static constexpr const char* audio_modes[] = {"Capture compatible (Cubeb)",
++                                                 "Low latency exclusive (WASAPI)"};
++  const std::string backend = Config::Get(Config::MAIN_AUDIO_BACKEND);
++  int audio_mode = backend == BACKEND_WASAPI ? 1 : 0;
++  ImGui::SetNextItemWidth(310.0f);
++  if (ImGui::Combo("Audio mode", &audio_mode, audio_modes, IM_ARRAYSIZE(audio_modes)))
++  {
++    Config::SetBaseOrCurrent(Config::MAIN_AUDIO_BACKEND,
++                             audio_mode == 0 ? std::string(BACKEND_CUBEB) :
++                                               std::string(BACKEND_WASAPI));
++  }
++  ImGui::TextWrapped("Capture compatible lets Xbox Game Bar and screen recorders include game "
++                     "audio. Exclusive mode can reduce latency, but capture software cannot hear it.");
++
++  ImGui::Spacing();
++  bool preserve_pitch = Config::Get(Config::MAIN_AUDIO_PRESERVE_PITCH);
++  if (ImGui::Checkbox("Preserve pitch when performance dips", &preserve_pitch))
++    Config::SetBaseOrCurrent(Config::MAIN_AUDIO_PRESERVE_PITCH, preserve_pitch);
++
++  int buffer_size = Config::Get(Config::MAIN_AUDIO_BUFFER_SIZE);
++  if (ImGui::SliderInt("Audio buffer (ms)", &buffer_size, 16, 160))
++    Config::SetBaseOrCurrent(Config::MAIN_AUDIO_BUFFER_SIZE, buffer_size);
++  ImGui::TextDisabled("Higher values prevent crackling when a scene hitches.");
++
++  bool fill_gaps = Config::Get(Config::MAIN_AUDIO_FILL_GAPS);
++  if (ImGui::Checkbox("Fill audio gaps", &fill_gaps))
++    Config::SetBaseOrCurrent(Config::MAIN_AUDIO_FILL_GAPS, fill_gaps);
++}
++
++void OnScreenUI::DrawSaveSettings()
++{
++  ImGui::TextUnformatted("Save data");
++  ImGui::TextDisabled("Backups are stored separately from the game's active Wii NAND data.");
++  ImGui::Spacing();
++
++  const u64 title_id = SConfig::GetInstance().GetTitleID();
++  if (ImGui::Button("Create backup", ImVec2(170.0f, 34.0f)))
++  {
++    const std::string save_path = Common::GetTitleDataPath(title_id) + "/";
++    const std::string backup_root = File::GetUserPath(D_BACKUP_IDX);
++    const std::string stamp = std::to_string(Common::Timer::NowMs());
++    const std::string destination = backup_root + "save-" + stamp + "/";
++    File::CreateFullPath(destination);
++    if (File::Copy(save_path, destination, true))
++      m_settings_status = "Save backed up to " + destination;
++    else
++      m_settings_status = "Backup failed. The game may not have created save data yet.";
++  }
++#ifdef _WIN32
++  ImGui::SameLine();
++  if (ImGui::Button("Open save folder", ImVec2(170.0f, 34.0f)))
++  {
++    std::string save_path = Common::GetTitleDataPath(title_id);
++    for (char& c : save_path)
++      if (c == '/')
++        c = '\\';
++    std::system(("explorer \"" + save_path + "\"").c_str());
++  }
++#endif
++
++  if (!m_settings_status.empty())
++  {
++    ImGui::Spacing();
++    ImGui::TextWrapped("%s", m_settings_status.c_str());
++  }
++}
++
+ void OnScreenUI::Finalize()
+ {
+   auto lock = GetImGuiLock();
+@@ -422,6 +1375,8 @@ void OnScreenUI::Finalize()
+   DrawDebugText();
+   OSD::DrawMessages();
+   DrawChallengesAndLeaderboards();
++  DrawFrontendMenu();
++  DrawSettingsPanel();
+   ImGui::Render();
+ 
+   // Check for font changes
+diff --git a/Source/Core/VideoCommon/OnScreenUI.h b/Source/Core/VideoCommon/OnScreenUI.h
+index e9a14e0..074d510 100644
+--- a/Source/Core/VideoCommon/OnScreenUI.h
++++ b/Source/Core/VideoCommon/OnScreenUI.h
+@@ -3,10 +3,12 @@
+ 
+ #pragma once
+ 
++#include <atomic>
+ #include <map>
+ #include <memory>
+ #include <mutex>
+ #include <span>
++#include <string>
+ #include <vector>
+ 
+ #include "Common/CommonTypes.h"
+@@ -60,9 +62,27 @@ public:
+   void SetMousePos(float x, float y);
+   void SetMousePress(u32 button_mask);
+ 
++  // In-game settings panel (ModernGekko): toggled from the host platform
++  // (F2 under Win32 NoGUI), drawn over the running game each frame.
++  void ToggleSettingsPanel() { m_show_settings = !m_show_settings.load(std::memory_order_relaxed); }
++  bool IsSettingsPanelVisible() const
++  {
++    return m_show_settings.load(std::memory_order_relaxed) || m_show_frontend_menu;
++  }
++
+ private:
+   void DrawDebugText();
+   void DrawChallengesAndLeaderboards();
++  void UpdateFrontendMenu();
++  void DrawFrontendMenu();
++  void DrawSettingsPanel();
++  void DrawDisplaySettings();
++  void DrawGraphicsSettings();
++  void DrawPerformanceSettings();
++  void DrawControllerSettings();
++  void DrawAudioSettings();
++  void DrawSaveSettings();
++  void DrawModSettings();
+   void UpdateImguiTexture(ImTextureData* tex);
+ 
+   // ImGui resources.
+@@ -81,6 +101,23 @@ private:
+   std::map<int, std::unique_ptr<AbstractTexture>, std::less<>> m_challenge_texture_map;
+ #endif  // USE_RETRO_ACHIEVEMENTS
+ 
++  std::atomic<bool> m_show_settings{false};
++  std::string m_settings_status;
++  int m_settings_category = 0;
++  bool m_frontend_finished = false;
++  bool m_show_frontend_menu = false;
++  bool m_settings_from_frontend = false;
++  bool m_settings_content_navigation = false;
++  bool m_settings_content_focus_pending = false;
++  bool m_frontend_accept_input = false;
++  bool m_frontend_confirm_exit = false;
++  bool m_frontend_play_transition = false;
++  bool m_frontend_title_confirmed = false;
++  int m_frontend_transition_frames = 0;
++  u16 m_frontend_buttons = 0;
++  u16 m_frontend_pressed = 0;
++  int m_frontend_selection = 0;
++
+   bool m_ready = false;
+ };
+ }  // namespace VideoCommon
+diff --git a/Source/Core/VideoCommon/PerformanceMetrics.cpp b/Source/Core/VideoCommon/PerformanceMetrics.cpp
+index fccc8ae..bbae488 100644
+--- a/Source/Core/VideoCommon/PerformanceMetrics.cpp
++++ b/Source/Core/VideoCommon/PerformanceMetrics.cpp
+@@ -10,8 +10,10 @@
+ 
+ #include "Common/HookableEvent.h"
+ #include "Core/Config/GraphicsSettings.h"
++#include "Core/Config/StaticRecompSettings.h"
+ #include "Core/Core.h"
+ #include "VideoCommon/FramebufferManager.h"
++#include "VideoCommon/Present.h"
+ #include "VideoCommon/VideoConfig.h"
+ 
+ PerformanceMetrics::PerformanceMetrics()
+@@ -319,7 +321,14 @@ void PerformanceMetrics::DrawImGuiStats(const float backbuffer_scale)
+         window_x -= ImGui::GetWindowWidth() + window_padding;
+       clamp_window_position();
+       if (g_ActiveConfig.bShowFPS)
+-        ImGui::TextColored(ImVec4(r, g, b, 1.0f), "FPS:%7.2lf", fps);
++      {
++        ImGui::TextColored(ImVec4(r, g, b, 1.0f), "Game:%6.2lf FPS", fps);
++        if (Config::Get(Config::MAIN_STATICRECOMP_INTERPOLATION) && g_presenter)
++        {
++          ImGui::TextColored(ImVec4(r, g, b, 1.0f), "Output:%4.0lf FPS",
++                             g_presenter->GetOutputPresentationRate());
++        }
++      }
+       if (g_ActiveConfig.bShowFTimes)
+       {
+         ImGui::TextColored(ImVec4(r, g, b, 1.0f), "dt:%6.2lfms",
+diff --git a/Source/Core/VideoCommon/Present.cpp b/Source/Core/VideoCommon/Present.cpp
+index 7c62730..ee1ae31 100644
+--- a/Source/Core/VideoCommon/Present.cpp
++++ b/Source/Core/VideoCommon/Present.cpp
+@@ -3,9 +3,17 @@
+ 
+ #include "VideoCommon/Present.h"
+ 
++#include <cstdio>
++
++#ifdef _WIN32
++#include <windows.h>
++#endif
++
+ #include "Common/ChunkFile.h"
++#include "Common/FrontendInput.h"
+ #include "Core/Config/GraphicsSettings.h"
+ #include "Core/Config/MainSettings.h"
++#include "Core/Config/StaticRecompSettings.h"
+ #include "Core/CoreTiming.h"
+ #include "Core/HW/VideoInterface.h"
+ #include "Core/Host.h"
+@@ -15,10 +23,14 @@
+ 
+ #include "Present.h"
+ #include "VideoCommon/AbstractGfx.h"
++#include "VideoCommon/AbstractPipeline.h"
++#include "VideoCommon/AbstractShader.h"
++#include "VideoCommon/FramebufferShaderGen.h"
+ #include "VideoCommon/FrameDumper.h"
+ #include "VideoCommon/FramebufferManager.h"
+ #include "VideoCommon/OnScreenUI.h"
+ #include "VideoCommon/PostProcessing.h"
++#include "VideoCommon/RenderState.h"
+ #include "VideoCommon/VertexManagerBase.h"
+ #include "VideoCommon/VideoConfig.h"
+ #include "VideoCommon/VideoEvents.h"
+@@ -28,6 +40,17 @@ std::unique_ptr<VideoCommon::Presenter> g_presenter;
+ 
+ namespace VideoCommon
+ {
++u32 GetHostRefreshRateHz()
++{
++#ifdef _WIN32
++  DEVMODEW mode{};
++  mode.dmSize = sizeof(mode);
++  if (EnumDisplaySettingsW(nullptr, ENUM_CURRENT_SETTINGS, &mode) && mode.dmDisplayFrequency > 1)
++    return mode.dmDisplayFrequency;
++#endif
++  return 0;
++}
++
+ // Stretches the native/internal analog resolution aspect ratio from ~4:3 to ~16:9
+ static float SourceAspectRatioToWidescreen(float source_aspect)
+ {
+@@ -106,6 +129,12 @@ Presenter::Presenter()
+ 
+ Presenter::~Presenter()
+ {
++  if (m_interpolated_present_count != 0)
++  {
++    std::fprintf(stderr, "[moderngekko-video] interpolated presents: %llu attempted, %llu accepted\n",
++                 static_cast<unsigned long long>(m_interpolated_present_count),
++                 static_cast<unsigned long long>(m_interpolated_present_success_count));
++  }
+   // Disable ControllerInterface's aspect ratio adjustments so mapping dialog behaves normally.
+   g_controller_interface.SetAspectRatioAdjustment(1);
+ }
+@@ -119,6 +148,7 @@ bool Presenter::Initialize()
+   if (!g_gfx->IsHeadless())
+   {
+     SetBackbuffer(g_gfx->GetSurfaceInfo());
++    m_host_refresh_rate = GetHostRefreshRateHz();
+ 
+     m_post_processor = std::make_unique<VideoCommon::PostProcessing>();
+     if (!m_post_processor->Initialize(m_backbuffer_format))
+@@ -128,6 +158,9 @@ bool Presenter::Initialize()
+     if (!m_onscreen_ui->Initialize(m_backbuffer_width, m_backbuffer_height, m_backbuffer_scale))
+       return false;
+ 
++    if (!InitializeInterFramePipeline())
++      Config::SetBaseOrCurrent(Config::MAIN_STATICRECOMP_INTERPOLATION, false);
++
+     // Draw a blank frame (and complete OnScreenUI initialization)
+     g_gfx->BindBackbuffer({{0.0f, 0.0f, 0.0f, 1.0f}});
+     g_gfx->PresentBackbuffer();
+@@ -138,6 +171,16 @@ bool Presenter::Initialize()
+ 
+ bool Presenter::FetchXFB(u32 xfb_addr, u32 fb_width, u32 fb_stride, u32 fb_height, u64 ticks)
+ {
++  const bool frontend_visible =
++      (m_onscreen_ui && m_onscreen_ui->IsSettingsPanelVisible()) ||
++      (FrontendInput::IsFileSelectCaptured() && !FrontendInput::IsFileSelectReleased());
++  if (frontend_visible)
++  {
++    m_stable_interpolation_frames = 0;
++    m_pending_interpolated_frames = 0;
++    m_interpolation_final_time_valid = false;
++    ResetInterFrameHistory();
++  }
+   ReleaseXFBContentLock();
+   u64 old_xfb_id = m_last_xfb_id;
+ 
+@@ -170,6 +213,61 @@ void Presenter::ViSwap(u32 xfb_addr, u32 fb_width, u32 fb_stride, u32 fb_height,
+ {
+   bool is_duplicate = FetchXFB(xfb_addr, fb_width, fb_stride, fb_height, ticks);
+ 
++  const TimePoint arrival_time = Clock::now();
++  if (!is_duplicate)
++  {
++    if (m_interpolation_cooldown_frames > 0)
++      --m_interpolation_cooldown_frames;
++    if (m_last_unique_frame_arrival != TimePoint{})
++    {
++      const double frame_interval =
++          std::chrono::duration<double>(arrival_time - m_last_unique_frame_arrival).count();
++      const double source_rate =
++          Core::System::GetInstance().GetVideoInterface().GetTargetRefreshRate();
++      const u32 requested_rate =
++          std::clamp(Config::Get(Config::MAIN_STATICRECOMP_INTERPOLATION_RATE), 60u, 360u);
++      const u32 effective_rate = m_host_refresh_rate >= 60 ?
++                                     std::min(requested_rate, m_host_refresh_rate) :
++                                     requested_rate;
++      const bool interpolation_available =
++          effective_rate > static_cast<u32>(std::ceil(source_rate + 1.0));
++      const double target_interval = source_rate > 1.0 ? 1.0 / source_rate : 1.0 / 60.0;
++      if (frame_interval >= 0.008 && frame_interval <= target_interval * 1.07)
++      {
++        m_stable_interpolation_frames = std::min(m_stable_interpolation_frames + 1, 8u);
++        m_slow_interpolation_frames = 0;
++      }
++      else
++      {
++        m_stable_interpolation_frames = 0;
++        if (frame_interval > target_interval * 1.07 && frame_interval < 0.5 &&
++            Config::Get(Config::MAIN_STATICRECOMP_INTERPOLATION) && interpolation_available)
++        {
++          ++m_slow_interpolation_frames;
++          if (m_slow_interpolation_frames >= 3)
++          {
++            m_interpolation_cooldown_frames = 120;
++            m_slow_interpolation_frames = 0;
++            ResetInterFrameHistory();
++            if (!m_interpolation_throttled_logged)
++            {
++              std::fprintf(stderr,
++                           "[moderngekko-video] interpolation suspended to protect 60 FPS "
++                           "(base frame %.2f ms)\n",
++                           frame_interval * 1000.0);
++              m_interpolation_throttled_logged = true;
++            }
++          }
++        }
++        else
++        {
++          m_slow_interpolation_frames = 0;
++        }
++      }
++    }
++    m_last_unique_frame_arrival = arrival_time;
++  }
++
+   PresentInfo present_info{
+       .present_count = m_present_count++,
+       .emulated_timestamp = ticks,
+@@ -212,7 +310,93 @@ void Presenter::ViSwap(u32 xfb_addr, u32 fb_width, u32 fb_stride, u32 fb_height,
+ 
+   if (!is_duplicate || !g_ActiveConfig.bSkipPresentingDuplicateXFBs)
+   {
++    const bool frontend_visible =
++        (m_onscreen_ui && m_onscreen_ui->IsSettingsPanelVisible()) ||
++        (FrontendInput::IsFileSelectCaptured() && !FrontendInput::IsFileSelectReleased());
++    const bool gameplay_ready =
++        !Config::Get(Config::MAIN_STATICRECOMP_CUSTOM_FRONTEND) ||
++        FrontendInput::IsFileSelectReleased();
++    const bool interpolation_requested =
++        Config::Get(Config::MAIN_STATICRECOMP_INTERPOLATION);
++    const u32 requested_rate =
++        std::clamp(Config::Get(Config::MAIN_STATICRECOMP_INTERPOLATION_RATE), 60u, 360u);
++    const u32 effective_rate =
++        m_host_refresh_rate >= 60 ? std::min(requested_rate, m_host_refresh_rate) : requested_rate;
++    const double source_rate =
++        Core::System::GetInstance().GetVideoInterface().GetTargetRefreshRate();
++    const bool high_refresh_available =
++        effective_rate > static_cast<u32>(std::ceil(source_rate + 1.0));
++    if (!interpolation_requested || !gameplay_ready || frontend_visible ||
++        g_ActiveConfig.bVSyncActive || g_ActiveConfig.stereo_mode != StereoMode::Off ||
++        !high_refresh_available)
++    {
++      m_stable_interpolation_frames = 0;
++      m_slow_interpolation_frames = 0;
++      m_interpolation_present_phase = 0.0;
++      ResetInterFrameHistory();
++    }
++
++    if (!is_duplicate && interpolation_requested && gameplay_ready && !frontend_visible &&
++        !g_ActiveConfig.bVSyncActive && g_ActiveConfig.stereo_mode == StereoMode::Off &&
++        high_refresh_available && m_stable_interpolation_frames >= 8 &&
++        m_interpolation_cooldown_frames == 0 && m_previous_xfb_valid &&
++        m_previous_xfb_texture && m_xfb_entry &&
++        m_inter_frame_pipeline &&
++        m_previous_xfb_texture->GetWidth() == m_xfb_entry->texture->GetWidth() &&
++        m_previous_xfb_texture->GetHeight() == m_xfb_entry->texture->GetHeight() &&
++        m_previous_xfb_texture->GetFormat() == m_xfb_entry->texture->GetFormat() &&
++        m_previous_xfb_texture->GetLayers() == m_xfb_entry->texture->GetLayers() &&
++        m_previous_xfb_texture->GetSamples() == m_xfb_entry->texture->GetSamples() &&
++        m_previous_xfb_rect.left == m_xfb_rect.left &&
++        m_previous_xfb_rect.top == m_xfb_rect.top &&
++        m_previous_xfb_rect.right == m_xfb_rect.right &&
++        m_previous_xfb_rect.bottom == m_xfb_rect.bottom)
++    {
++      if (source_rate >= 50.0 && source_rate <= 61.0)
++      {
++        m_interpolation_present_phase += static_cast<double>(effective_rate) / source_rate;
++        u32 presentation_count =
++            static_cast<u32>(std::floor(m_interpolation_present_phase + 1e-9));
++        m_interpolation_present_phase -= presentation_count;
++        presentation_count = std::clamp(presentation_count, 1u, 6u);
++        m_pending_interpolated_frames = presentation_count - 1;
++        if (m_pending_interpolated_frames != 0)
++        {
++          m_interpolation_present_interval =
++              std::chrono::duration_cast<DT>(DT_s(1.0 / effective_rate));
++          m_interpolation_first_present_time =
++              std::max(GetUpdatedPresentationTime(presentation_time), Clock::now());
++          m_interpolation_final_present_time =
++              m_interpolation_first_present_time +
++              m_interpolation_present_interval * m_pending_interpolated_frames;
++          m_interpolation_final_time_valid = true;
++        }
++        if (!m_interpolation_logged)
++        {
++          std::fprintf(stderr,
++                       "[moderngekko-video] interpolation active: %.2f Hz source, %u FPS "
++                       "requested, %u FPS effective, %u Hz display\n",
++                       source_rate, requested_rate, effective_rate, m_host_refresh_rate);
++          m_interpolation_logged = true;
++        }
++      }
++    }
++    else if (interpolation_requested && gameplay_ready && !frontend_visible &&
++             !high_refresh_available && !m_interpolation_logged)
++    {
++      std::fprintf(stderr,
++                   "[moderngekko-video] interpolation unavailable: %.2f Hz source, %u FPS "
++                   "requested, %u Hz display\n",
++                   source_rate, requested_rate, m_host_refresh_rate);
++      m_interpolation_logged = true;
++    }
+     Present(&present_info);
++    if (!is_duplicate && interpolation_requested && gameplay_ready && !frontend_visible &&
++        !g_ActiveConfig.bVSyncActive && g_ActiveConfig.stereo_mode == StereoMode::Off &&
++        high_refresh_available && m_interpolation_cooldown_frames == 0)
++    {
++      CaptureCurrentXFBForInterpolation();
++    }
+     ProcessFrameDumping(ticks);
+ 
+     video_events.after_present_event.Trigger(present_info);
+@@ -337,6 +521,7 @@ void Presenter::SetBackbuffer(SurfaceInfo info)
+   const bool is_first = m_backbuffer_width == 0 && m_backbuffer_height == 0;
+   const bool size_changed =
+       (m_backbuffer_width != (int)info.width || m_backbuffer_height != (int)info.height);
++  const bool format_changed = m_backbuffer_format != info.format;
+   m_backbuffer_width = info.width;
+   m_backbuffer_height = info.height;
+   m_backbuffer_scale = info.scale;
+@@ -345,6 +530,13 @@ void Presenter::SetBackbuffer(SurfaceInfo info)
+     m_onscreen_ui->SetScale(info.scale);
+ 
+   OnBackbufferSet(size_changed, is_first);
++
++  if (!is_first && format_changed && m_inter_frame_pipeline)
++  {
++    g_gfx->WaitForGPUIdle();
++    if (!InitializeInterFramePipeline())
++      Config::SetBaseOrCurrent(Config::MAIN_STATICRECOMP_INTERPOLATION, false);
++  }
+ }
+ 
+ void Presenter::OnBackbufferSet(bool size_changed, bool is_first_set)
+@@ -583,6 +775,153 @@ void Presenter::ReleaseXFBContentLock()
+     m_xfb_entry->ReleaseContentLock();
+ }
+ 
++bool Presenter::InitializeInterFramePipeline()
++{
++  m_inter_frame_pipeline.reset();
++  m_inter_frame_vertex_shader.reset();
++  m_inter_frame_pixel_shader.reset();
++
++  m_inter_frame_vertex_shader = g_gfx->CreateShaderFromSource(
++      ShaderStage::Vertex, FramebufferShaderGen::GenerateInterFrameVertexShader(), nullptr,
++      "Galaxy PC inter-frame vertex shader");
++  m_inter_frame_pixel_shader = g_gfx->CreateShaderFromSource(
++      ShaderStage::Pixel, FramebufferShaderGen::GenerateInterFramePixelShader(), nullptr,
++      "Galaxy PC inter-frame pixel shader");
++  if (!m_inter_frame_vertex_shader || !m_inter_frame_pixel_shader)
++    return false;
++
++  AbstractPipelineConfig config = {};
++  config.vertex_shader = m_inter_frame_vertex_shader.get();
++  config.pixel_shader = m_inter_frame_pixel_shader.get();
++  config.rasterization_state =
++      RenderState::GetNoCullRasterizationState(PrimitiveType::Triangles);
++  config.depth_state = RenderState::GetNoDepthTestingDepthState();
++  config.blending_state = RenderState::GetNoBlendingBlendState();
++  config.framebuffer_state = RenderState::GetColorFramebufferState(m_backbuffer_format);
++  config.usage = AbstractPipelineUsage::Utility;
++  m_inter_frame_pipeline = g_gfx->CreatePipeline(config);
++  return static_cast<bool>(m_inter_frame_pipeline);
++}
++
++void Presenter::ResetInterFrameHistory()
++{
++  m_previous_xfb_valid = false;
++  m_pending_interpolated_frames = 0;
++  m_interpolation_final_time_valid = false;
++}
++
++void Presenter::CaptureCurrentXFBForInterpolation()
++{
++  if (!m_xfb_entry || m_xfb_entry->texture->GetSamples() != 1)
++  {
++    ResetInterFrameHistory();
++    return;
++  }
++
++  const AbstractTexture* const source = m_xfb_entry->texture.get();
++  if (!m_previous_xfb_texture || m_previous_xfb_texture->GetWidth() != source->GetWidth() ||
++      m_previous_xfb_texture->GetHeight() != source->GetHeight() ||
++      m_previous_xfb_texture->GetFormat() != source->GetFormat() ||
++      m_previous_xfb_texture->GetLayers() != source->GetLayers() ||
++      m_previous_xfb_texture->GetSamples() != source->GetSamples())
++  {
++    m_previous_xfb_texture =
++        g_gfx->CreateTexture(source->GetConfig(), "Galaxy PC previous XFB");
++  }
++
++  if (!m_previous_xfb_texture)
++  {
++    ResetInterFrameHistory();
++    return;
++  }
++
++  m_previous_xfb_texture->CopyRectangleFromTexture(
++      source, source->GetRect(), 0, 0, m_previous_xfb_texture->GetRect(), 0, 0);
++  m_previous_xfb_texture->FinishedRendering();
++  m_previous_xfb_rect = m_xfb_rect;
++  m_previous_xfb_valid = true;
++}
++
++void Presenter::RecordOutputPresentation()
++{
++  const TimePoint now = Clock::now();
++  if (m_output_rate_window_start == TimePoint{})
++    m_output_rate_window_start = now;
++
++  ++m_output_presents_in_window;
++  const double elapsed =
++      std::chrono::duration<double>(now - m_output_rate_window_start).count();
++  if (elapsed >= 0.5)
++  {
++    m_output_presentation_rate =
++        static_cast<double>(m_output_presents_in_window) / elapsed;
++    m_output_presents_in_window = 0;
++    m_output_rate_window_start = now;
++  }
++}
++
++void Presenter::PresentInterpolatedFrame(float alpha, TimePoint presentation_time, bool finalize_ui)
++{
++  if (!m_previous_xfb_texture || !m_xfb_entry || !m_inter_frame_pipeline)
++    return;
++
++  g_vertex_manager->Flush();
++  UpdateDrawRectangle();
++  g_gfx->BeginUtilityDrawing();
++  const bool backbuffer_bound = g_gfx->BindBackbuffer({{0.0f, 0.0f, 0.0f, 1.0f}});
++  if (backbuffer_bound)
++  {
++    struct alignas(16) InterFrameUniforms
++    {
++      float alpha;
++      float padding[3];
++      float source_rect[4];
++    };
++    MathUtil::Rectangle<int> render_target_rect = GetTargetRectangle();
++    MathUtil::Rectangle<int> render_source_rect = AdjustForCustomCrop(m_xfb_rect);
++    AdjustRectanglesToFitBounds(&render_target_rect, &render_source_rect, m_backbuffer_width,
++                                m_backbuffer_height);
++    const float inverse_width = 1.0f / m_xfb_entry->texture->GetWidth();
++    const float inverse_height = 1.0f / m_xfb_entry->texture->GetHeight();
++    const InterFrameUniforms uniforms{
++        alpha,
++        {0.0f, 0.0f, 0.0f},
++        {render_source_rect.left * inverse_width, render_source_rect.top * inverse_height,
++         render_source_rect.GetWidth() * inverse_width,
++         render_source_rect.GetHeight() * inverse_height}};
++    g_vertex_manager->UploadUtilityUniforms(&uniforms, sizeof(uniforms));
++    g_gfx->SetViewportAndScissor(g_gfx->ConvertFramebufferRectangle(
++        render_target_rect, g_gfx->GetCurrentFramebuffer()));
++    g_gfx->SetPipeline(m_inter_frame_pipeline.get());
++    g_gfx->SetSamplerState(0, RenderState::GetLinearSamplerState());
++    g_gfx->SetSamplerState(1, RenderState::GetLinearSamplerState());
++    g_gfx->SetTexture(0, m_previous_xfb_texture.get());
++    g_gfx->SetTexture(1, m_xfb_entry->texture.get());
++    g_gfx->Draw(0, 3);
++  }
++
++  if (m_onscreen_ui)
++  {
++    if (finalize_ui)
++      m_onscreen_ui->Finalize();
++    if (backbuffer_bound)
++      m_onscreen_ui->DrawImGui();
++  }
++
++  {
++    std::lock_guard<std::mutex> guard(m_swap_mutex);
++    Core::System::GetInstance().GetCoreTiming().SleepUntil(presentation_time);
++    if (g_gfx->PresentBackbufferNonBlocking())
++    {
++      ++m_interpolated_present_success_count;
++      RecordOutputPresentation();
++    }
++  }
++  ++m_interpolated_present_count;
++  ++m_present_count;
++  g_gfx->EndUtilityDrawing();
++}
++
+ void Presenter::ChangeSurface(void* new_surface_handle)
+ {
+   std::lock_guard<std::mutex> lock(m_swap_mutex);
+@@ -714,7 +1053,8 @@ void Presenter::UpdateDrawRectangle()
+     float source_aspect_ratio = vi.GetAspectRatio();
+     // If the game is meant to be in widescreen (or forced to),
+     // scale the source aspect ratio to it.
+-    if (g_widescreen->IsGameWidescreen())
++    if (g_widescreen->IsGameWidescreen() ||
++        g_ActiveConfig.aspect_mode == AspectMode::Custom)
+       source_aspect_ratio = SourceAspectRatioToWidescreen(source_aspect_ratio);
+ 
+     const float adjust = source_aspect_ratio / draw_aspect_ratio;
+@@ -730,12 +1070,17 @@ void Presenter::UpdateDrawRectangle()
+       g_Config.fAspectRatioHackW = adjust;
+       g_Config.fAspectRatioHackH = 1;
+     }
++    g_Config.fUIAspectRatioHackW =
++        g_ActiveConfig.aspect_mode == AspectMode::Stretch ?
++            1.0f :
++            std::min(1.0f, source_aspect_ratio / draw_aspect_ratio);
+   }
+   else
+   {
+     // Hack is disabled.
+     g_Config.fAspectRatioHackW = 1;
+     g_Config.fAspectRatioHackH = 1;
++    g_Config.fUIAspectRatioHackW = 1;
+   }
+ 
+   // The rendering window size
+@@ -903,6 +1248,11 @@ void Presenter::Present(PresentInfo* present_info)
+ {
+   m_present_count++;
+ 
++  const u32 interpolated_frames = m_pending_interpolated_frames;
++  m_pending_interpolated_frames = 0;
++  const bool use_interpolation_final_time = m_interpolation_final_time_valid;
++  m_interpolation_final_time_valid = false;
++
+   if (g_gfx->IsHeadless() || (!m_onscreen_ui && !m_xfb_entry))
+     return;
+ 
+@@ -922,6 +1272,18 @@ void Presenter::Present(PresentInfo* present_info)
+     return;
+   }
+ 
++  bool ui_finalized = false;
++  for (u32 frame = 0; frame < interpolated_frames; ++frame)
++  {
++    const float alpha = static_cast<float>(frame + 1) /
++                        static_cast<float>(interpolated_frames + 1);
++    PresentInterpolatedFrame(alpha,
++                             m_interpolation_first_present_time +
++                                 m_interpolation_present_interval * frame,
++                             !ui_finalized);
++    ui_finalized = true;
++  }
++
+   // Since we use the common pipelines here and draw vertices if a batch is currently being
+   // built by the vertex loader, we end up trampling over its pointer, as we share the buffer
+   // with the loader, and it has not been unmapped yet. Force a pipeline flush to avoid this.
+@@ -945,7 +1307,8 @@ void Presenter::Present(PresentInfo* present_info)
+ 
+   if (m_onscreen_ui)
+   {
+-    m_onscreen_ui->Finalize();
++    if (!ui_finalized)
++      m_onscreen_ui->Finalize();
+     if (backbuffer_bound)
+       m_onscreen_ui->DrawImGui();
+   }
+@@ -956,7 +1319,9 @@ void Presenter::Present(PresentInfo* present_info)
+ 
+     if (present_info != nullptr)
+     {
+-      const auto present_time = GetUpdatedPresentationTime(present_info->intended_present_time);
++      const auto present_time = use_interpolation_final_time ?
++                                    m_interpolation_final_present_time :
++                                    GetUpdatedPresentationTime(present_info->intended_present_time);
+ 
+       Core::System::GetInstance().GetCoreTiming().SleepUntil(present_time);
+ 
+@@ -966,6 +1331,7 @@ void Presenter::Present(PresentInfo* present_info)
+     }
+ 
+     g_gfx->PresentBackbuffer();
++    RecordOutputPresentation();
+   }
+ 
+   if (m_xfb_entry)
+@@ -1028,6 +1394,17 @@ void Presenter::SetMousePos(float x, float y)
+     m_onscreen_ui->SetMousePos(x, y);
+ }
+ 
++void Presenter::ToggleOnScreenSettings()
++{
++  if (m_onscreen_ui)
++    m_onscreen_ui->ToggleSettingsPanel();
++}
++
++bool Presenter::IsOnScreenSettingsVisible() const
++{
++  return m_onscreen_ui && m_onscreen_ui->IsSettingsPanelVisible();
++}
++
+ void Presenter::SetMousePress(u32 button_mask)
+ {
+   if (m_onscreen_ui)
+diff --git a/Source/Core/VideoCommon/Present.h b/Source/Core/VideoCommon/Present.h
+index 91ba870..1b269bb 100644
+--- a/Source/Core/VideoCommon/Present.h
++++ b/Source/Core/VideoCommon/Present.h
+@@ -17,6 +17,8 @@
+ #include <tuple>
+ 
+ class AbstractTexture;
++class AbstractPipeline;
++class AbstractShader;
+ struct SurfaceInfo;
+ enum class DolphinKey;
+ 
+@@ -25,6 +27,8 @@ namespace VideoCommon
+ class OnScreenUI;
+ class PostProcessing;
+ 
++u32 GetHostRefreshRateHz();
++
+ // Presenter is a class that deals with putting the final XFB on the screen.
+ // It also handles the ImGui UI and post-processing.
+ class Presenter
+@@ -102,8 +106,18 @@ public:
+   void SetKey(u32 key, bool is_down, const char* chars);
+   void SetMousePos(float x, float y);
+   void SetMousePress(u32 button_mask);
++  void ToggleOnScreenSettings();
++  bool IsOnScreenSettingsVisible() const;
+ 
+   int FrameCount() const { return m_frame_count; }
++  bool HasXFB() const { return static_cast<bool>(m_xfb_entry); }
++  u32 GetLastXFBAddress() const { return m_last_xfb_addr; }
++  u32 GetLastXFBWidth() const { return m_last_xfb_width; }
++  u32 GetLastXFBStride() const { return m_last_xfb_stride; }
++  u32 GetLastXFBHeight() const { return m_last_xfb_height; }
++  double GetOutputPresentationRate() const { return m_output_presentation_rate; }
++  u32 GetHostRefreshRate() const { return m_host_refresh_rate; }
++  const MathUtil::Rectangle<int>& GetXFBRectangle() const { return m_xfb_rect; }
+ 
+   void DoState(PointerWrap& p);
+ 
+@@ -115,6 +129,11 @@ private:
+   bool FetchXFB(u32 xfb_addr, u32 fb_width, u32 fb_stride, u32 fb_height, u64 ticks);
+ 
+   void ProcessFrameDumping(u64 ticks) const;
++  bool InitializeInterFramePipeline();
++  void PresentInterpolatedFrame(float alpha, TimePoint presentation_time, bool finalize_ui);
++  void CaptureCurrentXFBForInterpolation();
++  void ResetInterFrameHistory();
++  void RecordOutputPresentation();
+ 
+   void OnBackBufferSizeChanged();
+ 
+@@ -152,6 +171,9 @@ private:
+   u32 m_auto_resolution_scale = 1;
+ 
+   RcTcacheEntry m_xfb_entry;
++  std::unique_ptr<AbstractTexture> m_previous_xfb_texture;
++  MathUtil::Rectangle<int> m_previous_xfb_rect{};
++  bool m_previous_xfb_valid = false;
+   // Internal resolution multiplier scaled XFB size
+   MathUtil::Rectangle<int> m_xfb_rect{0, 0, MAX_XFB_WIDTH, MAX_XFB_HEIGHT};
+ 
+@@ -164,6 +186,28 @@ private:
+ 
+   std::unique_ptr<VideoCommon::PostProcessing> m_post_processor;
+   std::unique_ptr<VideoCommon::OnScreenUI> m_onscreen_ui;
++  std::unique_ptr<AbstractShader> m_inter_frame_vertex_shader;
++  std::unique_ptr<AbstractShader> m_inter_frame_pixel_shader;
++  std::unique_ptr<AbstractPipeline> m_inter_frame_pipeline;
++
++  u32 m_pending_interpolated_frames = 0;
++  double m_interpolation_present_phase = 0.0;
++  TimePoint m_interpolation_first_present_time{};
++  TimePoint m_interpolation_final_present_time{};
++  DT m_interpolation_present_interval{};
++  bool m_interpolation_final_time_valid = false;
++  TimePoint m_last_unique_frame_arrival{};
++  u32 m_stable_interpolation_frames = 0;
++  u32 m_slow_interpolation_frames = 0;
++  u32 m_interpolation_cooldown_frames = 0;
++  bool m_interpolation_logged = false;
++  bool m_interpolation_throttled_logged = false;
++  u64 m_interpolated_present_count = 0;
++  u64 m_interpolated_present_success_count = 0;
++  TimePoint m_output_rate_window_start{};
++  u64 m_output_presents_in_window = 0;
++  double m_output_presentation_rate = 0.0;
++  u32 m_host_refresh_rate = 0;
+ 
+   u64 m_frame_count = 0;
+   u64 m_present_count = 0;
+diff --git a/Source/Core/VideoCommon/VertexShaderManager.cpp b/Source/Core/VideoCommon/VertexShaderManager.cpp
+index 6d69803..2598338 100644
+--- a/Source/Core/VideoCommon/VertexShaderManager.cpp
++++ b/Source/Core/VideoCommon/VertexShaderManager.cpp
+@@ -76,10 +76,10 @@ Common::Matrix44 VertexShaderManager::LoadProjectionMatrix()
+ 
+   case ProjectionType::Orthographic:
+   {
+-    m_projection_matrix[0] = rawProjection[0];
++    m_projection_matrix[0] = rawProjection[0] * g_ActiveConfig.fUIAspectRatioHackW;
+     m_projection_matrix[1] = 0.0f;
+     m_projection_matrix[2] = 0.0f;
+-    m_projection_matrix[3] = rawProjection[1];
++    m_projection_matrix[3] = rawProjection[1] * g_ActiveConfig.fUIAspectRatioHackW;
+ 
+     m_projection_matrix[4] = 0.0f;
+     m_projection_matrix[5] = rawProjection[2];
+diff --git a/Source/Core/VideoCommon/VideoConfig.h b/Source/Core/VideoCommon/VideoConfig.h
+index ec06f4a..2182bb6 100644
+--- a/Source/Core/VideoCommon/VideoConfig.h
++++ b/Source/Core/VideoCommon/VideoConfig.h
+@@ -301,6 +301,7 @@ struct VideoConfig final
+   int iSafeTextureCache_ColorSamples = 0;
+   float fAspectRatioHackW = 1;  // Initial value needed for the first frame
+   float fAspectRatioHackH = 1;
++  float fUIAspectRatioHackW = 1;
+   bool bEnablePixelLighting = false;
+   bool bFastDepthCalc = false;
+   bool bVertexRounding = false;
+diff --git a/module-template/CMakeLists.txt b/module-template/CMakeLists.txt
+index a49e3cc..1bb45d3 100644
+--- a/module-template/CMakeLists.txt
++++ b/module-template/CMakeLists.txt
+@@ -84,5 +84,13 @@ elseif(CMAKE_C_COMPILER_ID STREQUAL "GNU")
+   target_compile_options(${MODULE_NAME} PRIVATE -O2 -fvisibility=hidden
+                          -ffp-contract=off -fno-fast-math)
+ elseif(MSVC)
+-  target_compile_options(${MODULE_NAME} PRIVATE /fp:strict)
++  # /fp:precise keeps per-operation IEEE semantics without contraction (the
++  # VS2022 default is fp:contract off) — the generated code encodes Gekko
++  # rounding explicitly, so fp:strict's exception/denormal bookkeeping only
++  # costs time. /GS- drops stack cookies in the leaf-heavy generated chunks.
++  target_compile_options(${MODULE_NAME} PRIVATE /fp:precise /GS- /Gw)
++  option(RECOMP_MODULE_LINK_MAP "Write an MSVC linker map for native profiling" OFF)
++  if(RECOMP_MODULE_LINK_MAP)
++    target_link_options(${MODULE_NAME} PRIVATE "/MAP:${CMAKE_CURRENT_BINARY_DIR}/${MODULE_NAME}.map")
++  endif()
+ endif()
+diff --git a/module-template/gen_module_tables.py b/module-template/gen_module_tables.py
+index baeffe2..24f6cdf 100644
+--- a/module-template/gen_module_tables.py
++++ b/module-template/gen_module_tables.py
+@@ -79,7 +79,7 @@ def main() -> int:
+     # interpreter for the session.
+     func_addrs = sorted(
+         int(a, 16)
+-        for a in re.findall(r"void func_([0-9A-Fa-f]{8})\(CPUState\* ctx\);", header)
++        for a in re.findall(r"void func_([0-9A-Fa-f]{8})\(CPUState\*[^)]*ctx\);", header)
+     )
+     if not func_addrs:
+         print("error: no func_ declarations found in", generated_h, file=sys.stderr)
+diff --git a/module-template/module_export.c b/module-template/module_export.c
+index e44a69e..2d50495 100644
+--- a/module-template/module_export.c
++++ b/module-template/module_export.c
+@@ -4,13 +4,32 @@
+ // StaticRecomp module ABI. All environment access goes through the CPUState
+ // hook pointers the chassis installs; this dylib has no host dependencies.
+ 
++#if defined(_MSC_VER)
++#define inline __forceinline
++#endif
+ #include "generated.h"
++#if defined(_MSC_VER)
++#undef inline
++#endif
+ 
+ #include "StaticRecompABI.h"
+ 
+ static int chassis_dispatch(CPUState* ctx, u32 address)
+ {
+-    return dolrecomp_call(ctx, address);
++    u32 blocks = 0;
++
++    ctx->pc = address;
++    do
++    {
++        if (!dolrecomp_call(ctx, ctx->pc))
++            return blocks != 0u;
++        ++blocks;
++        if (ctx->pc == address)
++            break;
++    } while (!ctx->exception && ctx->dispatch_budget != 0 &&
++             ctx->downcount > -ctx->dispatch_budget && blocks < 65536u);
++
++    return 1;
+ }
+ 
+ static void chassis_on_state_loaded(CPUState* ctx)

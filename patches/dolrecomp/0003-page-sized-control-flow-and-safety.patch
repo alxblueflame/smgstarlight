@@ -1,0 +1,257 @@
+diff --git a/src/app/pipeline.c b/src/app/pipeline.c
+index c46df431bf7da93d87a3e8045ac9ccb150f723d5..d08e67359653666d950f3b1a6369eb3a506fe9e7 100644
+--- a/src/app/pipeline.c
++++ b/src/app/pipeline.c
+@@ -10,6 +10,9 @@
+ #include "backend/emitter.h"
+ #include "backend/dispatch.h"
+ #include "backend/codegen.h"
++
++// Chunk sizing is part of the generated module format; rebuild this pipeline
++// whenever EMIT_CHUNK_INSTRUCTIONS changes.
+ #include "analysis/code_section.h"
+ #include "analysis/embedded_data.h"
+ #include "analysis/smc.h"
+@@ -501,4 +504,3 @@ done:
+     path_list_free(&paths);
+     return ok;
+ }
+-
+diff --git a/src/backend/codegen.h b/src/backend/codegen.h
+index 87f8f5d9ab756c56cf4fe3a9ce6998b2aa6e9a1f..13dc83c97384eb8dd1e3bdeb7fbf56d43b0d9292 100644
+--- a/src/backend/codegen.h
++++ b/src/backend/codegen.h
+@@ -6,7 +6,9 @@
+ #include "backend/emitter.h"
+ #include "analysis/code_section.h"
+ 
+-#define EMIT_CHUNK_INSTRUCTIONS 4096u
++// Page-sized chunks keep generated functions and their switch tables small
++// enough for host compilers while the module-local dispatcher links them.
++#define EMIT_CHUNK_INSTRUCTIONS 1024u
+ 
+ typedef struct {
+     const PPCInst* insts;
+diff --git a/src/backend/emitter.c b/src/backend/emitter.c
+index f9fb98184615fdaf3497093a47442d7d14388afe..9926662d5578d598a5e6ebb793e0e94cd47cfb8e 100644
+--- a/src/backend/emitter.c
++++ b/src/backend/emitter.c
+@@ -320,11 +320,12 @@ static void emit_fallback_with_fallthrough(FILE* out, const PPCInst* inst) {
+     fprintf(out, "    if (ctx->pc != 0x%08Xu) return;\n", inst->address + 4);
+ }
+ 
+-// Forward local branches jump natively (goto); backward edges and computed
+-// targets return to the host dispatcher so idle-loop detection and CoreTiming
+-// idle-skip stay effective — keeping poll loops in-chunk would spin them at
+-// full cost instead of yielding to the next scheduled event.
+-static void emit_direct_branch(FILE* out, const PPCInst* inst, bool local_target) {
++// Forward edges within a generated chunk stay as native gotos. Calls,
++// backward edges, computed targets, and cross-chunk targets return to the
++// module-local dispatcher so it can recognize polling loops cheaply.
++static void emit_direct_branch(FILE* out, const PPCInst* inst,
++                               u32 func_start, u32 func_end) {
++    bool local_target = branch_target_is_local(func_start, func_end, inst->branch_target);
+     bool local_backward = local_target && inst->branch_target <= inst->address;
+ 
+     if (inst->lk) {
+@@ -1559,16 +1560,26 @@ static void emit_instruction_with_range(FILE* out, const PPCInst* inst,
+ 
+     case PPC_OP_DCBST:
+     case PPC_OP_DCBF:
+-    case PPC_OP_DCBI:
+-    case PPC_OP_ICBI:
+     case PPC_OP_DCBTST:
+     case PPC_OP_DCBT:
+-        /* Cache maintenance: transparent in software emulation — memory is always
+-           coherent. SMC detection handles icbi-signalled code modification via
+-           write-watching, not via this hook. */
+         fprintf(out, "    (void)ctx;\n");
+         break;
+ 
++    case PPC_OP_DCBI:
++        fprintf(out, "    if (ctx->msr & PPC_MSR_PR) {\n");
++        fprintf(out, "        ppc_program_exception(ctx, PPC_PROGRAM_PRIV, 0x%08Xu);\n",
++                inst->address);
++        fprintf(out, "        return;\n");
++        fprintf(out, "    }\n");
++        break;
++
++    case PPC_OP_ICBI:
++        fprintf(out, "    ppc_fallback_instruction(ctx, 0x%08Xu, 0x%08Xu);\n",
++                inst->raw, inst->address);
++        fprintf(out, "    ctx->dispatch_budget = 0;\n");
++        fprintf(out, "    return;\n");
++        break;
++
+     case PPC_OP_LMW:
+         fprintf(out, "    {\n");
+         fprintf(out, "        u32 ea = ");
+@@ -1591,8 +1602,7 @@ static void emit_instruction_with_range(FILE* out, const PPCInst* inst,
+ 
+     case PPC_OP_B:
+         fprintf(out, "    {\n");
+-        emit_direct_branch(out, inst,
+-                           branch_target_is_local(func_start, func_end, inst->branch_target));
++        emit_direct_branch(out, inst, func_start, func_end);
+         fprintf(out, "    }\n");
+         break;
+ 
+@@ -1600,8 +1610,7 @@ static void emit_instruction_with_range(FILE* out, const PPCInst* inst,
+         fprintf(out, "    {\n");
+         emit_branch_condition(out, inst->bo, inst->bi);
+         fprintf(out, "        if (ctr_ok && cr_ok) {\n");
+-        emit_direct_branch(out, inst,
+-                           branch_target_is_local(func_start, func_end, inst->branch_target));
++        emit_direct_branch(out, inst, func_start, func_end);
+         fprintf(out, "        }\n");
+         fprintf(out, "    }\n");
+         break;
+@@ -1727,6 +1736,8 @@ static void emit_instruction_with_range(FILE* out, const PPCInst* inst,
+         case 1: fprintf(out, "    ctx->gpr[%u] = ctx->xer;\n", inst->rD); break;
+         case 8: fprintf(out, "    ctx->gpr[%u] = ctx->lr;\n", inst->rD); break;
+         case 9: fprintf(out, "    ctx->gpr[%u] = ctx->ctr;\n", inst->rD); break;
++        case 18: fprintf(out, "    ctx->gpr[%u] = ctx->dsisr;\n", inst->rD); break;
++        case 19: fprintf(out, "    ctx->gpr[%u] = ctx->dar;\n", inst->rD); break;
+         case 26: fprintf(out, "    ctx->gpr[%u] = ctx->srr0;\n", inst->rD); break;
+         case 27: fprintf(out, "    ctx->gpr[%u] = ctx->srr1;\n", inst->rD); break;
+         case 268:
+@@ -1746,10 +1757,7 @@ static void emit_instruction_with_range(FILE* out, const PPCInst* inst,
+         case 282: fprintf(out, "    ctx->gpr[%u] = ctx->ear;\n", inst->rD); break;
+         case 920: fprintf(out, "    ctx->gpr[%u] = ctx->hid2;\n", inst->rD); break;
+         default:
+-            /* Unmodeled SPR read: return 0. These are typically performance
+-               counters or L2 control registers; Galaxy never uses the return
+-               value for correctness-critical control flow. */
+-            fprintf(out, "    ctx->gpr[%u] = 0;\n", inst->rD);
++            emit_fallback_with_fallthrough(out, inst);
+             break;
+         }
+         break;
+@@ -1759,6 +1767,8 @@ static void emit_instruction_with_range(FILE* out, const PPCInst* inst,
+         case 1: fprintf(out, "    ctx->xer = ctx->gpr[%u];\n", inst->rS); break;
+         case 8: fprintf(out, "    ctx->lr = ctx->gpr[%u];\n", inst->rS); break;
+         case 9: fprintf(out, "    ctx->ctr = ctx->gpr[%u];\n", inst->rS); break;
++        case 18: fprintf(out, "    ctx->dsisr = ctx->gpr[%u];\n", inst->rS); break;
++        case 19: fprintf(out, "    ctx->dar = ctx->gpr[%u];\n", inst->rS); break;
+         case 26: fprintf(out, "    ctx->srr0 = ctx->gpr[%u];\n", inst->rS); break;
+         case 27: fprintf(out, "    ctx->srr1 = ctx->gpr[%u];\n", inst->rS); break;
+         case 282: fprintf(out, "    ctx->ear = ctx->gpr[%u];\n", inst->rS); break;
+@@ -1772,9 +1782,7 @@ static void emit_instruction_with_range(FILE* out, const PPCInst* inst,
+         case 919: fprintf(out, "    ctx->gqr[7] = ctx->gpr[%u];\n", inst->rS); break;
+         case 920: fprintf(out, "    ctx->hid2 = ctx->gpr[%u];\n", inst->rS); break;
+         default:
+-            /* Unmodeled SPR write: NOP. These are typically performance counters
+-               or L2 control registers with no emulated effect. */
+-            fprintf(out, "    (void)ctx;\n");
++            emit_fallback_with_fallthrough(out, inst);
+             break;
+         }
+         break;
+@@ -1827,7 +1835,7 @@ void emit_instruction(FILE* out, const PPCInst* inst) {
+ 
+ static bool mfspr_is_modeled(u16 spr) {
+     switch (spr) {
+-    case 1: case 8: case 9: case 26: case 27:
++    case 1: case 8: case 9: case 18: case 19: case 26: case 27:
+     case 268: case 269: case 282:
+     case 912: case 913: case 914: case 915:
+     case 916: case 917: case 918: case 919: case 920:
+@@ -1839,7 +1847,7 @@ static bool mfspr_is_modeled(u16 spr) {
+ 
+ static bool mtspr_is_modeled(u16 spr) {
+     switch (spr) {
+-    case 1: case 8: case 9: case 26: case 27: case 282:
++    case 1: case 8: case 9: case 18: case 19: case 26: case 27: case 282:
+     case 912: case 913: case 914: case 915:
+     case 916: case 917: case 918: case 919: case 920:
+         return true;
+@@ -1850,8 +1858,13 @@ static bool mtspr_is_modeled(u16 spr) {
+ 
+ static bool inst_routes_to_fallback(const PPCInst* inst) {
+     switch (inst->op) {
++    case PPC_OP_ICBI:
+     case PPC_OP_UNKNOWN:
+         return true;
++    case PPC_OP_MFSPR:
++        return !mfspr_is_modeled(inst->spr);
++    case PPC_OP_MTSPR:
++        return !mtspr_is_modeled(inst->spr);
+     default:
+         return false;
+     }
+diff --git a/src/cpu/cpu.h b/src/cpu/cpu.h
+index 3d31c51c843f93caf135ee1ba5735acea6c227f6..076aa49a5c4a94de5b914e725700812eb54428d1 100644
+--- a/src/cpu/cpu.h
++++ b/src/cpu/cpu.h
+@@ -3,6 +3,14 @@
+ 
+ #include "common/types.h"
+ 
++#if defined(_MSC_VER)
++#define GXRUNTIME_RESTRICT __restrict
++#elif defined(__GNUC__) || defined(__clang__)
++#define GXRUNTIME_RESTRICT __restrict__
++#else
++#define GXRUNTIME_RESTRICT
++#endif
++
+ #define GC_MAIN_RAM_SIZE    (24 * 1024 * 1024)
+ #define GC_RAM_BASE         0x80000000u
+ #define GC_RAM_UNCACHED     0xC0000000u
+@@ -24,6 +32,7 @@
+ #define PPC_PROGRAM_TRAP      0x00020000u
+ 
+ #define PPC_DSI_EAR_DISABLED  0x00100000u
++#define PPC_MSR_PR             0x00004000u
+ 
+ #define PPC_VECTOR_MACHINE_CHECK 0x00200u
+ #define PPC_VECTOR_DSI           0x00300u
+@@ -96,6 +105,7 @@ struct CPUState {
+     u8* mem2;
+     u32 mem2_size;
+     s64 downcount;
++    s64 dispatch_budget;
+ };
+ 
+ bool cpu_init(CPUState* cpu);
+diff --git a/tests/cmake/codegen_compile.cmake b/tests/cmake/codegen_compile.cmake
+index ce7f2ac89bbf4b2e661e62b24b02f5fec11b87d4..78182df0228a3679bfda68f502a5e0f246487375 100644
+--- a/tests/cmake/codegen_compile.cmake
++++ b/tests/cmake/codegen_compile.cmake
+@@ -24,8 +24,14 @@ endif()
+ if(NOT generated_source MATCHES "if \\(!ppc_fp_available\\(ctx, 0x8000317Cu\\)\\) return;")
+     message(FATAL_ERROR "generated floating-point code has no MSR FP gate")
+ endif()
+-if(NOT generated_source MATCHES "ppc_fallback_instruction\\(ctx, 0x7C13A0ACu")
+-    message(FATAL_ERROR "dcbf codegen does not route through the environment fallback")
++if(generated_source MATCHES "ppc_fallback_instruction\\(ctx, 0x7C13A0ACu")
++    message(FATAL_ERROR "dcbf codegen still routes through the environment fallback")
++endif()
++if(NOT generated_source MATCHES "ppc_fallback_instruction\\(ctx, 0x7C1BE7ACu")
++    message(FATAL_ERROR "icbi codegen does not preserve instruction-cache invalidation")
++endif()
++if(NOT generated_source MATCHES "ppc_fallback_instruction\\(ctx, 0x7C1BE7ACu[^}]*ctx->dispatch_budget = 0;[^}]*return;")
++    message(FATAL_ERROR "icbi codegen does not yield for chunk revalidation")
+ endif()
+ 
+ get_filename_component(output_dir "${OUTPUT_C}" DIRECTORY)
+@@ -34,15 +40,18 @@ set(check_build_dir "${output_dir}/codegen_check_build")
+ 
+ file(TO_CMAKE_PATH "${OUTPUT_C}" output_c_cmake)
+ file(TO_CMAKE_PATH "${REPO_SRC}" repo_src_cmake)
++file(TO_CMAKE_PATH "${check_src_dir}" check_src_dir_cmake)
+ 
+ file(MAKE_DIRECTORY "${check_src_dir}")
++file(MAKE_DIRECTORY "${check_src_dir}/core")
++file(WRITE "${check_src_dir}/core/cpu.h" "#include \"cpu/cpu.h\"\n")
+ file(WRITE "${check_src_dir}/CMakeLists.txt"
+ "cmake_minimum_required(VERSION 3.16)
+ project(CodegenCompileCheck C)
+ set(CMAKE_C_STANDARD 11)
+ set(CMAKE_C_STANDARD_REQUIRED ON)
+ add_library(codegen_check OBJECT \"${output_c_cmake}\")
+-target_include_directories(codegen_check PRIVATE \"${repo_src_cmake}\")
++target_include_directories(codegen_check PRIVATE \"${check_src_dir_cmake}\" \"${repo_src_cmake}\")
+ ")
+ 
+ set(configure_args -S "${check_src_dir}" -B "${check_build_dir}")

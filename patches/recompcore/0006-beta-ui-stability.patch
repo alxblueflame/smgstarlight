@@ -1,0 +1,48 @@
+diff --git a/Source/Core/Core/Config/StaticRecompSettings.cpp b/Source/Core/Core/Config/StaticRecompSettings.cpp
+--- a/Source/Core/Core/Config/StaticRecompSettings.cpp
++++ b/Source/Core/Core/Config/StaticRecompSettings.cpp
+@@ -13,6 +13,6 @@ const Info<bool> MAIN_STATICRECOMP_STARTUP_STATUS{
+     {System::Main, "GalaxyPC", "StartupStatus"}, true};
+ const Info<bool> MAIN_STATICRECOMP_INTERPOLATION{
+-    {System::Main, "GalaxyPC", "PresentationInterpolation"}, true};
++    {System::Main, "GalaxyPC", "PresentationInterpolation"}, false};
+ const Info<u32> MAIN_STATICRECOMP_INTERPOLATION_RATE{
+     {System::Main, "GalaxyPC", "PresentationRate"}, 120};
+ }  // namespace Config
+diff --git a/Source/Core/Common/FrontendInput.h b/Source/Core/Common/FrontendInput.h
+--- a/Source/Core/Common/FrontendInput.h
++++ b/Source/Core/Common/FrontendInput.h
+@@ -32,7 +32,8 @@ inline u16 GetButtons()
+ 
+ inline void ObserveGuestPc(u32 pc)
+ {
+-  if (pc >= 0x8017C7B4 && pc < 0x8017C874)
++  if ((pc >= 0x8038F084 && pc < 0x8038F418) ||
++      (pc >= 0x8017C7B4 && pc < 0x8017C874))
+     s_title_observed.store(true, std::memory_order_release);
+ 
+   if (s_title_observed.load(std::memory_order_acquire) && pc >= 0x8017C874 &&
+diff --git a/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_Run.cpp b/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_Run.cpp
+--- a/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_Run.cpp
++++ b/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_Run.cpp
+@@ -148,6 +148,7 @@ void StaticRecompCore::Run()
+         {
+           u32 dispatch_pc = m_guest.pc;
+-          if (dispatch_pc >= 0x8017C7B4 && dispatch_pc < 0x8017D0A0)
++          if ((dispatch_pc >= 0x8038F084 && dispatch_pc < 0x8038F418) ||
++              (dispatch_pc >= 0x8017C7B4 && dispatch_pc < 0x8017D0A0))
+             FrontendInput::ObserveGuestPc(dispatch_pc);
+ 
+           if (!file_select_visibility_finished &&
+diff --git a/Source/Core/VideoCommon/OnScreenUI.cpp b/Source/Core/VideoCommon/OnScreenUI.cpp
+--- a/Source/Core/VideoCommon/OnScreenUI.cpp
++++ b/Source/Core/VideoCommon/OnScreenUI.cpp
+@@ -317,7 +317,7 @@ void OnScreenUI::DrawImGui()
+   {
+     const ImDrawList* cmdlist = draw_data->CmdLists[i];
+     if (cmdlist->VtxBuffer.empty() || cmdlist->IdxBuffer.empty())
+-      return;
++      continue;
+ 
+     u32 base_vertex, base_index;
+     g_vertex_manager->UploadUtilityVertices(cmdlist->VtxBuffer.Data, sizeof(ImDrawVert),

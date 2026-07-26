@@ -1,0 +1,945 @@
+diff --git a/Source/Core/Core/HW/GPFifo.cpp b/Source/Core/Core/HW/GPFifo.cpp
+index 0de434b..2b44cf7 100644
+--- a/Source/Core/Core/HW/GPFifo.cpp
++++ b/Source/Core/Core/HW/GPFifo.cpp
+@@ -3,14 +3,18 @@
+ 
+ #include "Core/HW/GPFifo.h"
+ 
++#include <algorithm>
+ #include <cstddef>
+ #include <cstring>
++#include <fstream>
++#include <vector>
+ 
+ #include "Common/ChunkFile.h"
+ #include "Common/CommonTypes.h"
+ #include "Common/Swap.h"
+ #include "Core/HW/Memmap.h"
+ #include "Core/HW/ProcessorInterface.h"
++#include "Core/CoreTiming.h"
+ #include "Core/PowerPC/JitInterface.h"
+ #include "Core/PowerPC/PowerPC.h"
+ #include "Core/System.h"
+@@ -18,6 +22,57 @@
+ 
+ namespace GPFifo
+ {
++namespace
++{
++constexpr u64 FNV_OFFSET_BASIS = 14695981039346656037ull;
++constexpr u64 FNV_PRIME = 1099511628211ull;
++
++u64 s_burst_trace_limit = 0;
++u64 s_burst_trace_hash = FNV_OFFSET_BASIS;
++u32 s_burst_trace_context = 0;
++u64 s_burst_trace_dispatch = 0;
++u32 s_burst_trace_last_context = 0;
++u32 s_burst_trace_dispatch_entry = 0;
++u32 s_burst_trace_last_dispatch_entry = 0;
++u64 s_burst_trace_last_dispatch = 0;
++u64 s_burst_trace_last_ticks = 0;
++std::array<u8, GATHER_PIPE_SIZE> s_burst_trace_last_data{};
++std::vector<u64> s_burst_trace_prefixes;
++std::vector<u64> s_burst_trace_chunks;
++std::vector<u32> s_burst_trace_contexts;
++std::vector<u32> s_burst_trace_dispatch_entries;
++std::vector<u64> s_burst_trace_dispatches;
++std::vector<u64> s_burst_trace_ticks;
++std::vector<u8> s_burst_trace_data;
++
++void TraceBurst(const u8* data, u64 ticks)
++{
++  if (s_burst_trace_limit == 0 || s_burst_trace_prefixes.size() >= s_burst_trace_limit)
++    return;
++
++  u64 chunk_hash = FNV_OFFSET_BASIS;
++  for (size_t i = 0; i < GATHER_PIPE_SIZE; ++i)
++  {
++    s_burst_trace_hash ^= data[i];
++    s_burst_trace_hash *= FNV_PRIME;
++    chunk_hash ^= data[i];
++    chunk_hash *= FNV_PRIME;
++  }
++  std::copy_n(data, GATHER_PIPE_SIZE, s_burst_trace_last_data.begin());
++  s_burst_trace_last_context = s_burst_trace_context;
++  s_burst_trace_last_dispatch_entry = s_burst_trace_dispatch_entry;
++  s_burst_trace_last_dispatch = s_burst_trace_dispatch;
++  s_burst_trace_last_ticks = ticks;
++  s_burst_trace_prefixes.push_back(s_burst_trace_hash);
++  s_burst_trace_chunks.push_back(chunk_hash);
++  s_burst_trace_contexts.push_back(s_burst_trace_context);
++  s_burst_trace_dispatch_entries.push_back(s_burst_trace_dispatch_entry);
++  s_burst_trace_dispatches.push_back(s_burst_trace_dispatch);
++  s_burst_trace_ticks.push_back(ticks);
++  s_burst_trace_data.insert(s_burst_trace_data.end(), data, data + GATHER_PIPE_SIZE);
++}
++}  // namespace
++
+ GPFifoManager::GPFifoManager(Core::System& system) : m_system(system)
+ {
+ }
+@@ -92,6 +147,7 @@ void GPFifoManager::UpdateGatherPipe()
+   size_t processed;
+   for (processed = 0; pipe_count >= GATHER_PIPE_SIZE; processed += GATHER_PIPE_SIZE)
+   {
++    TraceBurst(m_gather_pipe + processed, m_system.GetCoreTiming().GetTicks());
+     // copy the GatherPipe
+     memory.CopyToEmu(processor_interface.m_fifo_cpu_write_pointer, m_gather_pipe + processed,
+                      GATHER_PIPE_SIZE);
+@@ -194,4 +250,95 @@ void FastCheckGatherPipe(GPFifoManager& gpfifo)
+ {
+   gpfifo.FastCheckGatherPipe();
+ }
++
++void ConfigureBurstTrace(u64 burst_limit)
++{
++  s_burst_trace_limit = burst_limit;
++  s_burst_trace_hash = FNV_OFFSET_BASIS;
++  s_burst_trace_context = 0;
++  s_burst_trace_dispatch = 0;
++  s_burst_trace_last_context = 0;
++  s_burst_trace_dispatch_entry = 0;
++  s_burst_trace_last_dispatch_entry = 0;
++  s_burst_trace_last_dispatch = 0;
++  s_burst_trace_last_ticks = 0;
++  s_burst_trace_last_data.fill(0);
++  s_burst_trace_prefixes.clear();
++  s_burst_trace_chunks.clear();
++  s_burst_trace_contexts.clear();
++  s_burst_trace_dispatch_entries.clear();
++  s_burst_trace_dispatches.clear();
++  s_burst_trace_ticks.clear();
++  s_burst_trace_data.clear();
++  if (burst_limit != 0)
++  {
++    s_burst_trace_prefixes.reserve(static_cast<size_t>(burst_limit));
++    s_burst_trace_chunks.reserve(static_cast<size_t>(burst_limit));
++    s_burst_trace_contexts.reserve(static_cast<size_t>(burst_limit));
++    s_burst_trace_dispatch_entries.reserve(static_cast<size_t>(burst_limit));
++    s_burst_trace_dispatches.reserve(static_cast<size_t>(burst_limit));
++    s_burst_trace_ticks.reserve(static_cast<size_t>(burst_limit));
++    s_burst_trace_data.reserve(static_cast<size_t>(burst_limit) * GATHER_PIPE_SIZE);
++  }
++}
++
++bool BurstTraceEnabled()
++{
++  return s_burst_trace_limit != 0;
++}
++
++void SetBurstTraceContext(u32 context, u64 dispatch)
++{
++  s_burst_trace_context = context;
++  s_burst_trace_dispatch = dispatch;
++}
++
++void SetBurstTraceDispatchEntry(u32 entry)
++{
++  s_burst_trace_dispatch_entry = entry;
++}
++
++BurstTraceSummary GetBurstTraceSummary()
++{
++  return {static_cast<u64>(s_burst_trace_prefixes.size()), s_burst_trace_limit,
++          s_burst_trace_prefixes.empty() ? FNV_OFFSET_BASIS : s_burst_trace_prefixes.back(),
++          s_burst_trace_last_context, s_burst_trace_last_dispatch_entry,
++          s_burst_trace_last_dispatch, s_burst_trace_last_ticks, s_burst_trace_last_data};
++}
++
++bool SaveBurstTrace(const std::string& path)
++{
++  std::ofstream file(path, std::ios::binary | std::ios::trunc);
++  if (!file)
++    return false;
++
++  file.write("MGFIFOH6", 8);
++  const u64 count = static_cast<u64>(s_burst_trace_prefixes.size());
++  file.write(reinterpret_cast<const char*>(&count), sizeof(count));
++  file.write(reinterpret_cast<const char*>(s_burst_trace_prefixes.data()),
++             static_cast<std::streamsize>(s_burst_trace_prefixes.size() * sizeof(u64)));
++  file.write(reinterpret_cast<const char*>(s_burst_trace_chunks.data()),
++             static_cast<std::streamsize>(s_burst_trace_chunks.size() * sizeof(u64)));
++  file.write(reinterpret_cast<const char*>(s_burst_trace_contexts.data()),
++             static_cast<std::streamsize>(s_burst_trace_contexts.size() * sizeof(u32)));
++  file.write(reinterpret_cast<const char*>(s_burst_trace_dispatch_entries.data()),
++             static_cast<std::streamsize>(s_burst_trace_dispatch_entries.size() * sizeof(u32)));
++  file.write(reinterpret_cast<const char*>(s_burst_trace_dispatches.data()),
++             static_cast<std::streamsize>(s_burst_trace_dispatches.size() * sizeof(u64)));
++  file.write(reinterpret_cast<const char*>(s_burst_trace_ticks.data()),
++             static_cast<std::streamsize>(s_burst_trace_ticks.size() * sizeof(u64)));
++  file.write(reinterpret_cast<const char*>(s_burst_trace_data.data()),
++             static_cast<std::streamsize>(s_burst_trace_data.size()));
++  file.write(reinterpret_cast<const char*>(&s_burst_trace_last_context),
++             sizeof(s_burst_trace_last_context));
++  file.write(reinterpret_cast<const char*>(&s_burst_trace_last_dispatch_entry),
++             sizeof(s_burst_trace_last_dispatch_entry));
++  file.write(reinterpret_cast<const char*>(&s_burst_trace_last_dispatch),
++             sizeof(s_burst_trace_last_dispatch));
++  file.write(reinterpret_cast<const char*>(&s_burst_trace_last_ticks),
++             sizeof(s_burst_trace_last_ticks));
++  file.write(reinterpret_cast<const char*>(s_burst_trace_last_data.data()),
++             static_cast<std::streamsize>(s_burst_trace_last_data.size()));
++  return file.good();
++}
+ }  // namespace GPFifo
+diff --git a/Source/Core/Core/HW/GPFifo.h b/Source/Core/Core/HW/GPFifo.h
+index 006c8ed..54884f1 100644
+--- a/Source/Core/Core/HW/GPFifo.h
++++ b/Source/Core/Core/HW/GPFifo.h
+@@ -3,6 +3,9 @@
+ 
+ #pragma once
+ 
++#include <array>
++#include <string>
++
+ #include "Common/CommonTypes.h"
+ 
+ class PointerWrap;
+@@ -65,4 +68,23 @@ private:
+ // For use from the JIT.
+ void UpdateGatherPipe(GPFifoManager& gpfifo);
+ void FastCheckGatherPipe(GPFifoManager& gpfifo);
++
++struct BurstTraceSummary
++{
++  u64 recorded_bursts = 0;
++  u64 requested_bursts = 0;
++  u64 final_hash = 0;
++  u32 last_context = 0;
++  u32 last_dispatch_entry = 0;
++  u64 last_dispatch = 0;
++  u64 last_ticks = 0;
++  std::array<u8, GATHER_PIPE_SIZE> last_data{};
++};
++
++void ConfigureBurstTrace(u64 burst_limit);
++bool BurstTraceEnabled();
++void SetBurstTraceContext(u32 context, u64 dispatch);
++void SetBurstTraceDispatchEntry(u32 entry);
++BurstTraceSummary GetBurstTraceSummary();
++bool SaveBurstTrace(const std::string& path);
+ }  // namespace GPFifo
+diff --git a/Source/Core/Core/PowerPC/Jit64/Jit.h b/Source/Core/Core/PowerPC/Jit64/Jit.h
+index da1be2d..8495d4a 100644
+--- a/Source/Core/Core/PowerPC/Jit64/Jit.h
++++ b/Source/Core/Core/PowerPC/Jit64/Jit.h
+@@ -91,6 +91,15 @@ public:
+ 
+   const CommonAsmRoutines* GetAsmRoutines() override { return &asm_routines; }
+   const char* GetName() const override { return "JIT64"; }
++  void SetExitAfterSlice(bool value) override
++  {
++    asm_routines.SetExitAfterSlice(value);
++    // A slice-leased JIT re-enters through Run() constantly; keep the BLR
++    // stack guard disarmed so ProtectStack stays a no-op and stack faults
++    // cannot originate from leased slices.
++    if (value)
++      m_enable_blr_optimization = false;
++  }
+   // Run!
+   void Run() override;
+   void SingleStep() override;
+diff --git a/Source/Core/Core/PowerPC/Jit64/JitAsm.cpp b/Source/Core/Core/PowerPC/Jit64/JitAsm.cpp
+index 7594d0e..91c9c0d 100644
+--- a/Source/Core/Core/PowerPC/Jit64/JitAsm.cpp
++++ b/Source/Core/Core/PowerPC/Jit64/JitAsm.cpp
+@@ -230,7 +230,13 @@ void Jit64AsmRoutineManager::Generate()
+   // Gets checked on at the end of every slice
+   MOV(64, R(RSCRATCH), ImmPtr(system.GetCPU().GetStatePtr()));
+   CMP(32, MatR(RSCRATCH), Imm32(std::to_underlying(CPU::State::Running)));
++  FixupBranch state_exit = J_CC(CC_NE);
++  // A slice-leased caller (StaticRecompCore fallback) wants control back at
++  // every slice boundary; the flag is constant false in standalone JIT runs.
++  MOV(64, R(RSCRATCH), ImmPtr(&m_exit_after_slice));
++  CMP(8, MatR(RSCRATCH), Imm8(0));
+   J_CC(CC_E, outerLoop);
++  SetJumpTarget(state_exit);
+ 
+   // Landing pad for drec space
+   dispatcher_exit = GetCodePtr();
+diff --git a/Source/Core/Core/PowerPC/Jit64/JitAsm.h b/Source/Core/Core/PowerPC/Jit64/JitAsm.h
+index 4db3c8f..d0ac16f 100644
+--- a/Source/Core/Core/PowerPC/Jit64/JitAsm.h
++++ b/Source/Core/Core/PowerPC/Jit64/JitAsm.h
+@@ -39,7 +39,14 @@ public:
+ 
+   void ResetStack(Gen::X64CodeBlock& emitter);
+ 
++  // When set, enter_code returns to the caller at the end of every timing
++  // slice instead of looping. StaticRecompCore uses this to lease single
++  // slices to the fallback JIT for code outside the recompiled module.
++  void SetExitAfterSlice(bool value) { m_exit_after_slice = value; }
++
+ private:
+   void Generate();
+   void GenerateCommon();
++
++  bool m_exit_after_slice = false;
+ };
+diff --git a/Source/Core/Core/PowerPC/JitCommon/JitBase.h b/Source/Core/Core/PowerPC/JitCommon/JitBase.h
+index 8643497..55bc4e8 100644
+--- a/Source/Core/Core/PowerPC/JitCommon/JitBase.h
++++ b/Source/Core/Core/PowerPC/JitCommon/JitBase.h
+@@ -229,6 +229,10 @@ public:
+   virtual bool HandleFault(uintptr_t access_address, SContext* ctx) = 0;
+   bool HandleStackFault();
+ 
++  // Slice-leased execution: when supported and enabled, Run() returns to the
++  // caller at every timing-slice boundary instead of looping until shutdown.
++  virtual void SetExitAfterSlice(bool) {}
++
+   static constexpr std::size_t code_buffer_size = 32000;
+ 
+   // This should probably be removed from public:
+diff --git a/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore.cpp b/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore.cpp
+index 605f7db..11e7d7b 100644
+--- a/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore.cpp
++++ b/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore.cpp
+@@ -4,6 +4,7 @@
+ #include "Core/PowerPC/StaticRecomp/StaticRecompCore.h"
+ 
+ #include <cstdio>
++#include <cstdlib>
+ #include <cstring>
+ 
+ #include "Common/Config/Config.h"
+@@ -109,6 +110,15 @@ void StaticRecompCore::Init()
+ 
+   LoadModule();
+   m_idle_pc = Config::Get(Config::MAIN_STATICRECOMP_IDLE_PC);
++  if (const char* value = std::getenv("STATICRECOMP_INTERPRET_START"))
++    m_force_interpreter_start = static_cast<u32>(std::strtoull(value, nullptr, 0));
++  if (const char* value = std::getenv("STATICRECOMP_INTERPRET_END"))
++    m_force_interpreter_end = static_cast<u32>(std::strtoull(value, nullptr, 0));
++  if (m_force_interpreter_start < m_force_interpreter_end)
++  {
++    std::fprintf(stderr, "[staticrecomp] forced interpreter range: [0x%08X,0x%08X)\n",
++                 m_force_interpreter_start, m_force_interpreter_end);
++  }
+   m_lockstep_verifier = std::make_unique<StaticRecompLockstep::StaticRecompLockstepVerifier>(*this);
+   m_lockstep_verifier->Init();
+ 
+@@ -117,8 +127,31 @@ void StaticRecompCore::Init()
+ #elif defined(_M_X86_64)
+   m_fallback_jit = std::make_unique<Jit64>(m_system);
+ #endif
++  // JitInterface::UpdateMembase consults the ACTIVE core's jo to pick
++  // ppc_state.mem_ptr. The fallback JIT compiles fastmem accesses against
++  // that pointer, so this core's fastmem view must match the fallback's or
++  // leased slices write through the wrong base and corrupt host memory.
++  InitFastmemArena();
++  jo.fastmem = Config::Get(Config::MAIN_FASTMEM) && jo.fastmem_arena;
++
+   if (m_fallback_jit)
+     m_fallback_jit->Init();
++
++  // Out-of-module code (exception vectors, runtime-loaded MEM2 modules such
++  // as RMGE01's HomeButtonMenuWrapperRSO) runs through the fallback JIT one
++  // timing slice at a time. The single-step interpreter remains available for
++  // lockstep verification and forced-interpreter range bisection.
++  m_jit_fallback = m_fallback_jit != nullptr &&
++                   !(m_force_interpreter_start < m_force_interpreter_end) &&
++                   std::getenv("STATICRECOMP_INTERP_FALLBACK") == nullptr;
++  if (const char* value = std::getenv("STATICRECOMP_JITFB_MIN"))
++    m_jit_fallback_min_pc = static_cast<u32>(std::strtoull(value, nullptr, 0));
++  if (m_jit_fallback)
++  {
++    m_fallback_jit->SetExitAfterSlice(true);
++    std::fprintf(stderr, "[staticrecomp] fallback engine: %s (slice-leased, min_pc=0x%08X)\n",
++                 m_fallback_jit->GetName(), m_jit_fallback_min_pc);
++  }
+ }
+ 
+ void StaticRecompCore::Shutdown()
+@@ -126,11 +159,12 @@ void StaticRecompCore::Shutdown()
+   g_static_recomp_core = nullptr;
+   std::fprintf(stderr,
+                "[staticrecomp] shutdown: native=%llu fallback=%llu native_exc=%llu hook_fb=%llu "
+-               "smc_failed=%u verifications=%llu reverify_events=%llu\n",
++               "smc_failed=%u verifications=%llu reverify_events=%llu jit_slices=%llu\n",
+                (unsigned long long)m_native_dispatches, (unsigned long long)m_fallback_steps,
+                (unsigned long long)m_native_exceptions,
+                (unsigned long long)m_hook_fallback_instructions, m_failed_chunks,
+-               (unsigned long long)m_verifications, (unsigned long long)m_reverify_events);
++               (unsigned long long)m_verifications, (unsigned long long)m_reverify_events,
++               (unsigned long long)m_fallback_jit_slices);
+   NOTICE_LOG_FMT(POWERPC,
+                  "StaticRecomp: shutdown. native_dispatches={} fallback_steps={} "
+                  "native_exceptions={} hook_fallback_instructions={} smc_failed_chunks={} "
+diff --git a/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore.h b/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore.h
+index 26a364d..8458419 100644
+--- a/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore.h
++++ b/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore.h
+@@ -56,7 +56,12 @@ public:
+ 
+   void ClearCache() override;
+   void Jit(u32 em_address) override {}
+-  bool HandleFault(uintptr_t access_address, SContext* ctx) override { return false; }
++  // Fastmem faults can only originate from the fallback JIT's generated code;
++  // the static module performs all guest accesses through the runtime hooks.
++  bool HandleFault(uintptr_t access_address, SContext* ctx) override
++  {
++    return m_fallback_jit && m_fallback_jit->HandleFault(access_address, ctx);
++  }
+ 
+   JitBaseBlockCache* GetBlockCache() override { return &m_block_cache; }
+   void EraseSingleBlock(const JitBlock& block) override {}
+@@ -160,6 +165,7 @@ private:
+   std::vector<int> m_chunk_lookup_table;
+   u32 m_lookup_ram_size = 0;
+   u32 m_lookup_exram_size = 0;
++  u32 CanonicalCodeAddress(u32 address) const;
+   int GetAddressLookupIndex(u32 address) const;
+   void InitLookupTable(u32 ram_size, u32 exram_size);
+ 
+@@ -168,6 +174,11 @@ private:
+   mutable u32 m_last_chunk_index = 0;
+ 
+   u32 m_idle_pc = 0;
++  u32 m_force_interpreter_start = 0;
++  u32 m_force_interpreter_end = 0;
++  bool m_jit_fallback = false;
++  u32 m_jit_fallback_min_pc = 0;
++  u64 m_fallback_jit_slices = 0;
+ };
+ 
+ extern StaticRecompCore* g_static_recomp_core;
+diff --git a/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_Hooks.cpp b/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_Hooks.cpp
+index bf7534c..7b6f860 100644
+--- a/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_Hooks.cpp
++++ b/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_Hooks.cpp
+@@ -59,6 +59,7 @@ void StaticRecompCore::HookExternalWrite(CPUState* cpu, u32 ea, u64 value, u8 si
+   // maintains ppc_state.gather_pipe_ptr internally.
+   if ((ea & 0xFFFFF000) == 0xCC008000u)
+   {
++    GPFifo::SetBurstTraceContext(cpu->pc, core->m_native_dispatches);
+     if (core->m_lockstep_verifier->m_ls_journaling)
+       core->m_lockstep_verifier->m_journal.native_mmio.push_back({ea, static_cast<u32>(value), size});
+     auto& gpfifo = core->m_system.GetGPFifo();
+diff --git a/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_Run.cpp b/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_Run.cpp
+index 062245d..de0a772 100644
+--- a/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_Run.cpp
++++ b/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_Run.cpp
+@@ -2,9 +2,14 @@
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
+ #include "Core/PowerPC/StaticRecomp/StaticRecompCore.h"
++#include "Core/HW/GPFifo.h"
++#include <algorithm>
++#include <cstdio>
++#include <unordered_map>
+ #include "Core/System.h"
+ #include "Core/PowerPC/PowerPC.h"
+ #include "Core/PowerPC/Interpreter/Interpreter.h"
++#include "Core/PowerPC/PPCAnalyst.h"
+ #include "Core/PowerPC/StaticRecomp/StaticRecompLockstep.h"
+ #include "Core/CoreTiming.h"
+ #include "Core/HW/CPU.h"
+@@ -26,6 +31,30 @@ void StaticRecompCore::Run()
+   auto& interpreter = m_system.GetInterpreter();
+   auto& memory = m_system.GetMemory();
+   const CPU::State* state_ptr = m_system.GetCPU().GetStatePtr();
++  u64 timing_slices = 0;
++  std::unordered_map<u32, bool> idle_loop_cache;
++
++  const auto is_idle_loop = [&idle_loop_cache](u32 address) {
++    if (const auto it = idle_loop_cache.find(address); it != idle_loop_cache.end())
++      return it->second;
++
++    PPCAnalyst::BlockStats stats{};
++    PPCAnalyst::BlockRegStats gpa{};
++    PPCAnalyst::BlockRegStats fpa{};
++    PPCAnalyst::CodeBlock block{};
++    block.m_stats = &stats;
++    block.m_gpa = &gpa;
++    block.m_fpa = &fpa;
++    PPCAnalyst::CodeBuffer code(64);
++    PPCAnalyst::PPCAnalyzer analyzer;
++    analyzer.Analyze(address, &block, &code, code.size());
++    const bool idle = std::any_of(code.begin(), code.begin() + block.m_num_instructions,
++                                  [](const auto& op) { return op.branchIsIdleLoop; });
++    idle_loop_cache.emplace(address, idle);
++    if (idle)
++      std::fprintf(stderr, "[staticrecomp] detected idle loop: pc=0x%08X\n", address);
++    return idle;
++  };
+ 
+   m_guest.ram = memory.GetRAM();
+   m_guest.ram_size = memory.GetRamSizeReal();
+@@ -45,6 +74,7 @@ void StaticRecompCore::Run()
+   while (*state_ptr == CPU::State::Running)
+   {
+     core_timing.Advance();
++    ++timing_slices;
+     const std::string current_game_id = SConfig::GetInstance().GetGameID();
+     m_module_active = m_module && (current_game_id.empty() || current_game_id == m_module->game_id);
+ 
+@@ -54,39 +84,55 @@ void StaticRecompCore::Run()
+       // FP-unavailable exception themselves (ppc_fp_available).
+       if (m_module_active && DispatchableAt(ppc.pc))
+       {
++        // Both diagnostics are compile-once conditions on the hot path: skip
++        // the out-of-line calls entirely in normal runs.
++        const bool lockstep_enabled = m_lockstep_verifier->IsEnabled();
++        const bool trace_enabled = GPFifo::BurstTraceEnabled();
+         SyncIn();
+         ++m_bursts;
+         do
+         {
+-          const bool do_ls = m_lockstep_verifier->ShouldCheck(m_guest.pc);
++          const bool do_ls = lockstep_enabled && m_lockstep_verifier->ShouldCheck(m_guest.pc);
+           if (do_ls)
+           {
+             m_lockstep_verifier->Prepare(m_guest);
+           }
+ 
+-          m_module->dispatch(&m_guest, m_guest.pc);
++          const u32 dispatch_pc = m_guest.pc;
++          if (trace_enabled)
++            GPFifo::SetBurstTraceDispatchEntry(dispatch_pc);
++          m_module->dispatch(&m_guest, dispatch_pc);
+           ++m_native_dispatches;
++          if ((m_native_dispatches % 10000000) == 0)
++            std::fprintf(stderr,
++                         "[staticrecomp] native progress: dispatches=%llu pc=0x%08X "
++                         "downcount=%d slices=%llu ticks=%llu bursts=%llu\n",
++                         (unsigned long long)m_native_dispatches, m_guest.pc, ppc.downcount,
++                         (unsigned long long)timing_slices,
++                         (unsigned long long)core_timing.GetTicks(),
++                         (unsigned long long)m_bursts);
+ 
+           if (do_ls)
+           {
+             m_lockstep_verifier->Verify(m_guest);
+           }
+ 
+-          // Flush the module's per-block cycle charges into Dolphin's
+-          // downcount. A dispatch that charged nothing (PC-switch default,
+-          // pure embedded data) still costs 1 so the burst always makes
+-          // downcount progress; this per-dispatch flush is also the
+-          // dispatcher back-edge timing check — CoreTiming regains control
+-          // with at least CachedInterpreter's per-block frequency, so
+-          // external-interrupt latency matches stock.
++          // Flush the module's accumulated per-block cycle charges into
++          // Dolphin's downcount. A dispatch that charged nothing (PC-switch
++          // default, pure embedded data) still costs 1 so the burst always
++          // makes progress; this per-dispatch flush is also the dispatcher
++          // back-edge timing check.
+           const s64 charge = -m_guest.downcount;
+           m_guest.downcount = 0;
+           ppc.downcount -= static_cast<int>(charge > 0 ? charge : 1);
+           m_charged_cycles += static_cast<u64>(charge > 0 ? charge : 1);
+           m_guest.timebase += static_cast<u64>(charge > 0 ? charge : 1);
+ 
+-          // Idle loop skipping for configured target loops (e.g. Wii Menu OSIdleThread)
+-          if (m_guest.pc == m_idle_pc && m_idle_pc != 0)
++          // Match Dolphin's JIT busy-wait handling for native blocks. The
++          // configured PC remains useful for loops that the conservative
++          // analyzer cannot prove idle.
++          if ((m_guest.pc == m_idle_pc && m_idle_pc != 0) ||
++              (m_guest.pc == dispatch_pc && is_idle_loop(dispatch_pc)))
+           {
+             m_system.GetCoreTiming().Idle();
+           }
+@@ -110,23 +156,45 @@ void StaticRecompCore::Run()
+         if ((ppc.Exceptions & SYNC_EXCEPTION_MASK) != 0)
+           power_pc.CheckExceptions();
+       }
++      else if (m_jit_fallback && ppc.pc >= m_jit_fallback_min_pc)
++      {
++        // Lease one timing slice to the fallback JIT. It compiles and runs
++        // whatever the guest PC points at (exception vectors, MEM2-resident
++        // modules) and returns when the slice's downcount is exhausted; the
++        // loop then re-checks whether the PC is back in module-covered code.
++        ++m_fallback_jit_slices;
++        m_fallback_jit->Run();
++      }
+       else
+       {
+         // SingleStepInner delivers synchronous exceptions itself; external
+         // interrupts are delivered at slice start, as in Interpreter::Run.
+-        if (m_fallback_jit)
++        if (m_fallback_steps == 0)
+         {
+-          m_fallback_jit->Run();
++          const u32 offset = ppc.pc & 0x01FFFFFFu;
++          const u8* ram = memory.GetRAM();
++          const u32 raw = offset + 3 < memory.GetRamSizeReal() ?
++                              (static_cast<u32>(ram[offset]) << 24) |
++                                  (static_cast<u32>(ram[offset + 1]) << 16) |
++                                  (static_cast<u32>(ram[offset + 2]) << 8) | ram[offset + 3] :
++                              0;
++          std::fprintf(stderr,
++                       "[staticrecomp] first block fallback: pc=0x%08X raw=0x%08X msr=0x%08X "
++                       "srr0=0x%08X srr1=0x%08X\n",
++                       ppc.pc, raw, ppc.msr.Hex, SRR0(ppc), SRR1(ppc));
+         }
+-        else
++        do
+         {
+-          do
+-          {
+-            ppc.downcount -= interpreter.SingleStepInner();
+-            ++m_fallback_steps;
+-          } while (!(m_module_active && DispatchableAt(ppc.pc)) && ppc.downcount > 0 &&
+-                   *state_ptr == CPU::State::Running);
+-        }
++          ppc.downcount -= interpreter.SingleStepInner();
++          ++m_fallback_steps;
++          if (m_fallback_steps <= 16)
++            std::fprintf(stderr, "[staticrecomp] fallback step: steps=%llu pc=0x%08X\n",
++                         (unsigned long long)m_fallback_steps, ppc.pc);
++          if ((m_fallback_steps % 1000000) == 0)
++            std::fprintf(stderr, "[staticrecomp] fallback progress: steps=%llu pc=0x%08X\n",
++                         (unsigned long long)m_fallback_steps, ppc.pc);
++        } while (!(m_module_active && DispatchableAt(ppc.pc)) && ppc.downcount > 0 &&
++                 *state_ptr == CPU::State::Running);
+       }
+     } while (ppc.downcount > 0 && *state_ptr == CPU::State::Running);
+   }
+diff --git a/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_SMC.cpp b/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_SMC.cpp
+index 9e4f51f..29bf60a 100644
+--- a/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_SMC.cpp
++++ b/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_SMC.cpp
+@@ -9,8 +9,18 @@
+ #include <algorithm>
+ #include <cstdio>
+ 
++u32 StaticRecompCore::CanonicalCodeAddress(u32 address) const
++{
++  if (address < m_lookup_ram_size)
++    return address | 0x80000000u;
++  if (address >= 0x10000000u && address < 0x10000000u + m_lookup_exram_size)
++    return address | 0x80000000u;
++  return address;
++}
++
+ int StaticRecompCore::GetAddressLookupIndex(u32 address) const
+ {
++  address = CanonicalCodeAddress(address);
+   if (address >= 0x80000000u && address < 0x80000000u + m_lookup_ram_size)
+     return static_cast<int>((address - 0x80000000u) >> 2);
+   if (address >= 0x90000000u && address < 0x90000000u + m_lookup_exram_size)
+@@ -65,12 +75,16 @@ int StaticRecompCore::ChunkIndexOf(u32 address) const
+ 
+ bool StaticRecompCore::FastDispatchableAt(u32 address) const
+ {
++  if (address >= m_force_interpreter_start && address < m_force_interpreter_end)
++    return false;
+   const int index = ChunkIndexOf(address);
+   return index >= 0 && m_chunk_state[index] == CHUNK_VERIFIED;
+ }
+ 
+ bool StaticRecompCore::DispatchableAt(u32 address)
+ {
++  if (address >= m_force_interpreter_start && address < m_force_interpreter_end)
++    return false;
+   const int index = ChunkIndexOf(address);
+   if (index < 0)
+     return false;
+@@ -134,6 +148,7 @@ void StaticRecompCore::OnICacheInvalidate(u32 address, u32 length)
+ 
+   if (!m_module_active || length == 0)
+     return;
++  address = CanonicalCodeAddress(address);
+   const u32 last = address + (length - 1u);
+ 
+   // Binary search to find the first chunk index that could possibly overlap (chunk.end > address)
+diff --git a/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompLockstep.cpp b/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompLockstep.cpp
+index da9fb99..47a1c3e 100644
+--- a/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompLockstep.cpp
++++ b/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompLockstep.cpp
+@@ -68,6 +68,10 @@ void StaticRecompLockstepVerifier::Init()
+     m_ls_start = std::strtoull(s, nullptr, 0);
+   if (const char* s = std::getenv("STATICRECOMP_LOCKSTEP_LIMIT"))
+     m_ls_limit = std::strtoull(s, nullptr, 0);
++  if (const char* s = std::getenv("STATICRECOMP_LOCKSTEP_TARGET"))
++    m_ls_target_pc = static_cast<u32>(std::strtoull(s, nullptr, 0));
++  if (const char* s = std::getenv("STATICRECOMP_LOCKSTEP_MAXCHECKS"))
++    m_ls_max_checks = std::strtoull(s, nullptr, 0);
+   if (const char* s = std::getenv("STATICRECOMP_LOCKSTEP_MAXREPORT"))
+     m_ls_max_report = std::strtoull(s, nullptr, 0);
+   if (const char* s = std::getenv("STATICRECOMP_LOCKSTEP_STEPCAP"))
+@@ -92,8 +96,10 @@ void StaticRecompLockstepVerifier::Init()
+ 
+   std::fprintf(
+       stderr,
+-      "[lockstep] ENABLED: start=%llu limit=%llu maxreport=%llu stepcap=%d whitelist=%zu\n",
++      "[lockstep] ENABLED: start=%llu limit=%llu target=0x%08X maxchecks=%llu "
++      "maxreport=%llu stepcap=%d whitelist=%zu\n",
+       (unsigned long long)m_ls_start, (unsigned long long)m_ls_limit,
++      m_ls_target_pc, (unsigned long long)m_ls_max_checks,
+       (unsigned long long)m_ls_max_report, m_ls_step_cap, m_ls_whitelist.size());
+ }
+ 
+@@ -103,6 +109,10 @@ bool StaticRecompLockstepVerifier::ShouldCheck(u32 address) const
+     return false;
+   if (!LockstepWindowOpen())
+     return false;
++  if (m_ls_max_checks != 0 && m_ls_checks >= m_ls_max_checks)
++    return false;
++  if (m_ls_target_pc != 0)
++    return address == m_ls_target_pc;
+   return m_ls_checked.find(address) == m_ls_checked.end();
+ }
+ 
+diff --git a/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompLockstep.h b/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompLockstep.h
+index 3e8a0ee..e68d5b7 100644
+--- a/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompLockstep.h
++++ b/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompLockstep.h
+@@ -144,6 +144,8 @@ private:
+   bool m_lockstep = false;
+   u64 m_ls_start = 0;             // begin checking at this native-dispatch index
+   u64 m_ls_limit = 0;            // stop checking after this index (0 = no bound)
++  u32 m_ls_target_pc = 0;       // repeatedly check one dispatch entry (0 = dedupe PCs)
++  u64 m_ls_max_checks = 0;      // cap checks in target mode (0 = unlimited)
+   u64 m_ls_max_report = 0;      // cap divergence reports (0 = unlimited)
+   int m_ls_step_cap = 512;      // interpreter single-steps before giving up on end PC
+   u64 m_ls_checks = 0;          // distinct blocks differentially checked
+diff --git a/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompLockstep_Check.cpp b/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompLockstep_Check.cpp
+index 6e72cb5..560ee6e 100644
+--- a/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompLockstep_Check.cpp
++++ b/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompLockstep_Check.cpp
+@@ -175,7 +175,7 @@ void StaticRecompLockstepVerifier::LockstepCheck(u32 entry_pc, u32 end_pc, const
+                    steps, before, ppc.gpr[3], ppc.gpr[4], ppc.gpr[5], ppc.msr.Hex,
+                    ppc.GetXER().Hex, ppc.cr.Get(), ppc.spr[SPR_LR], ppc.spr[SPR_CTR]);
+     }
+-    if (ppc.pc == end_pc)
++    if (ppc.pc == end_pc && (!end_is_loop_header || interp_cycles >= native_charge))
+       break;
+     if (ppc.Exceptions != 0)
+       break;
+diff --git a/Source/Core/DolphinNoGUI/PlatformWin32.cpp b/Source/Core/DolphinNoGUI/PlatformWin32.cpp
+index f4849df..5fe4e6c 100644
+--- a/Source/Core/DolphinNoGUI/PlatformWin32.cpp
++++ b/Source/Core/DolphinNoGUI/PlatformWin32.cpp
+@@ -204,8 +204,27 @@ LRESULT PlatformWin32::WndProc(const HWND hwnd, const UINT msg, const WPARAM wPa
+   case WM_KEYDOWN:
+     if (wParam == VK_ESCAPE)
+       platform->RequestShutdown();
++    else if (wParam == VK_F2 && g_presenter)
++      g_presenter->ToggleOnScreenSettings();
+     break;
+ 
++  // Feed the mouse to ImGui while the in-game settings panel is open so its
++  // widgets are clickable; the emulated pointer keeps receiving input via
++  // ControllerInterface as usual.
++  case WM_MOUSEMOVE:
++    if (g_presenter && g_presenter->IsOnScreenSettingsVisible())
++    {
++      g_presenter->SetMousePos(static_cast<float>(static_cast<short>(LOWORD(lParam))),
++                               static_cast<float>(static_cast<short>(HIWORD(lParam))));
++    }
++    return DefWindowProc(hwnd, msg, wParam, lParam);
++
++  case WM_LBUTTONDOWN:
++  case WM_LBUTTONUP:
++    if (g_presenter && g_presenter->IsOnScreenSettingsVisible())
++      g_presenter->SetMousePress(msg == WM_LBUTTONDOWN ? 1u : 0u);
++    return DefWindowProc(hwnd, msg, wParam, lParam);
++
+   case WM_CLOSE:
+     platform->RequestShutdown();
+     break;
+diff --git a/Source/Core/VideoCommon/OnScreenUI.cpp b/Source/Core/VideoCommon/OnScreenUI.cpp
+index 451109b..58c7a02 100644
+--- a/Source/Core/VideoCommon/OnScreenUI.cpp
++++ b/Source/Core/VideoCommon/OnScreenUI.cpp
+@@ -11,9 +11,12 @@
+ 
+ #include "Core/Achievements/AchievementManager.h"
+ #include "Core/Config/AchievementSettings.h"
++#include "Common/NandPaths.h"
++#include "Core/Config/ConfigManager.h"
+ #include "Core/Config/GraphicsSettings.h"
+ #include "Core/Config/MainSettings.h"
+ #include "Core/Config/NetplaySettings.h"
++#include <cstdlib>
+ #include "Core/Movie.h"
+ #include "Core/System.h"
+ 
+@@ -413,6 +416,88 @@ void OnScreenUI::DrawChallengesAndLeaderboards()
+ #endif  // USE_RETRO_ACHIEVEMENTS
+ }
+ 
++void OnScreenUI::DrawSettingsPanel()
++{
++  if (!m_show_settings.load(std::memory_order_relaxed))
++    return;
++
++  ImGui::SetNextWindowPos(ImVec2(24.0f * m_backbuffer_scale, 24.0f * m_backbuffer_scale),
++                          ImGuiCond_FirstUseEver);
++  ImGui::SetNextWindowBgAlpha(0.94f);
++  bool open = true;
++  if (ImGui::Begin("Settings  (F2 to close)", &open, ImGuiWindowFlags_AlwaysAutoResize))
++  {
++    // Internal resolution: Dolphin applies GFX_EFB_SCALE changes live.
++    static const char* const resolutions[] = {"Auto (window size)", "1x (640x528)",
++                                              "2x (1280x1056)",     "3x (1920x1584)",
++                                              "4x (2560x2112)",     "5x (3200x2640)",
++                                              "6x (3840x3168)"};
++    int scale = Config::Get(Config::GFX_EFB_SCALE);
++    if (scale < 0 || scale > 6)
++      scale = 0;
++    if (ImGui::Combo("Internal resolution", &scale, resolutions, IM_ARRAYSIZE(resolutions)))
++      Config::SetBaseOrCurrent(Config::GFX_EFB_SCALE, scale);
++
++    float speed = Config::Get(Config::MAIN_EMULATION_SPEED);
++    bool unlimited = speed <= 0.0f;
++    if (ImGui::Checkbox("Unlimited speed", &unlimited))
++      Config::SetBaseOrCurrent(Config::MAIN_EMULATION_SPEED, unlimited ? 0.0f : 1.0f);
++    if (!unlimited)
++    {
++      if (ImGui::SliderFloat("Speed limit", &speed, 0.25f, 2.0f, "%.2fx"))
++        Config::SetBaseOrCurrent(Config::MAIN_EMULATION_SPEED, speed);
++    }
++
++    bool vsync = Config::Get(Config::GFX_VSYNC);
++    if (ImGui::Checkbox("VSync", &vsync))
++      Config::SetBaseOrCurrent(Config::GFX_VSYNC, vsync);
++
++    bool show_fps = Config::Get(Config::GFX_SHOW_FPS);
++    if (ImGui::Checkbox("FPS / speed overlay", &show_fps))
++    {
++      Config::SetBaseOrCurrent(Config::GFX_SHOW_FPS, show_fps);
++      Config::SetBaseOrCurrent(Config::GFX_SHOW_SPEED, show_fps);
++    }
++
++    bool hires = Config::Get(Config::GFX_HIRES_TEXTURES);
++    if (ImGui::Checkbox("Custom HD textures", &hires))
++      Config::SetBaseOrCurrent(Config::GFX_HIRES_TEXTURES, hires);
++
++    ImGui::Separator();
++    const u64 title_id = SConfig::GetInstance().GetTitleID();
++    if (ImGui::Button("Back up save now"))
++    {
++      const std::string save_path = Common::GetTitleDataPath(title_id) + "/";
++      const std::string backup_root = File::GetUserPath(D_BACKUP_IDX);
++      const std::string stamp = std::to_string(Common::Timer::NowMs());
++      const std::string destination = backup_root + "save-" + stamp + "/";
++      File::CreateFullPath(destination);
++      if (File::Copy(save_path, destination, true))
++        m_settings_status = "Save backed up to " + destination;
++      else
++        m_settings_status = "Backup failed (no save data yet?)";
++    }
++#ifdef _WIN32
++    ImGui::SameLine();
++    if (ImGui::Button("Open save folder"))
++    {
++      const std::string save_path = Common::GetTitleDataPath(title_id);
++      std::string command = "explorer \"" + save_path + "\"";
++      for (char& c : command)
++        if (c == '/')
++          c = '\\';
++      std::system(command.c_str());
++    }
++#endif
++    if (!m_settings_status.empty())
++      ImGui::TextWrapped("%s", m_settings_status.c_str());
++    ImGui::TextDisabled("The game keeps running behind this panel.");
++  }
++  ImGui::End();
++  if (!open)
++    m_show_settings = false;
++}
++
+ void OnScreenUI::Finalize()
+ {
+   auto lock = GetImGuiLock();
+@@ -422,6 +507,7 @@ void OnScreenUI::Finalize()
+   DrawDebugText();
+   OSD::DrawMessages();
+   DrawChallengesAndLeaderboards();
++  DrawSettingsPanel();
+   ImGui::Render();
+ 
+   // Check for font changes
+diff --git a/Source/Core/VideoCommon/OnScreenUI.h b/Source/Core/VideoCommon/OnScreenUI.h
+index e9a14e0..796e9c8 100644
+--- a/Source/Core/VideoCommon/OnScreenUI.h
++++ b/Source/Core/VideoCommon/OnScreenUI.h
+@@ -3,10 +3,12 @@
+ 
+ #pragma once
+ 
++#include <atomic>
+ #include <map>
+ #include <memory>
+ #include <mutex>
+ #include <span>
++#include <string>
+ #include <vector>
+ 
+ #include "Common/CommonTypes.h"
+@@ -60,9 +62,15 @@ public:
+   void SetMousePos(float x, float y);
+   void SetMousePress(u32 button_mask);
+ 
++  // In-game settings panel (ModernGekko): toggled from the host platform
++  // (F2 under Win32 NoGUI), drawn over the running game each frame.
++  void ToggleSettingsPanel() { m_show_settings = !m_show_settings.load(std::memory_order_relaxed); }
++  bool IsSettingsPanelVisible() const { return m_show_settings.load(std::memory_order_relaxed); }
++
+ private:
+   void DrawDebugText();
+   void DrawChallengesAndLeaderboards();
++  void DrawSettingsPanel();
+   void UpdateImguiTexture(ImTextureData* tex);
+ 
+   // ImGui resources.
+@@ -81,6 +89,9 @@ private:
+   std::map<int, std::unique_ptr<AbstractTexture>, std::less<>> m_challenge_texture_map;
+ #endif  // USE_RETRO_ACHIEVEMENTS
+ 
++  std::atomic<bool> m_show_settings{false};
++  std::string m_settings_status;
++
+   bool m_ready = false;
+ };
+ }  // namespace VideoCommon
+diff --git a/Source/Core/VideoCommon/Present.cpp b/Source/Core/VideoCommon/Present.cpp
+index 7c62730..eff5155 100644
+--- a/Source/Core/VideoCommon/Present.cpp
++++ b/Source/Core/VideoCommon/Present.cpp
+@@ -1028,6 +1028,17 @@ void Presenter::SetMousePos(float x, float y)
+     m_onscreen_ui->SetMousePos(x, y);
+ }
+ 
++void Presenter::ToggleOnScreenSettings()
++{
++  if (m_onscreen_ui)
++    m_onscreen_ui->ToggleSettingsPanel();
++}
++
++bool Presenter::IsOnScreenSettingsVisible() const
++{
++  return m_onscreen_ui && m_onscreen_ui->IsSettingsPanelVisible();
++}
++
+ void Presenter::SetMousePress(u32 button_mask)
+ {
+   if (m_onscreen_ui)
+diff --git a/Source/Core/VideoCommon/Present.h b/Source/Core/VideoCommon/Present.h
+index 91ba870..633c8f0 100644
+--- a/Source/Core/VideoCommon/Present.h
++++ b/Source/Core/VideoCommon/Present.h
+@@ -102,8 +102,16 @@ public:
+   void SetKey(u32 key, bool is_down, const char* chars);
+   void SetMousePos(float x, float y);
+   void SetMousePress(u32 button_mask);
++  void ToggleOnScreenSettings();
++  bool IsOnScreenSettingsVisible() const;
+ 
+   int FrameCount() const { return m_frame_count; }
++  bool HasXFB() const { return static_cast<bool>(m_xfb_entry); }
++  u32 GetLastXFBAddress() const { return m_last_xfb_addr; }
++  u32 GetLastXFBWidth() const { return m_last_xfb_width; }
++  u32 GetLastXFBStride() const { return m_last_xfb_stride; }
++  u32 GetLastXFBHeight() const { return m_last_xfb_height; }
++  const MathUtil::Rectangle<int>& GetXFBRectangle() const { return m_xfb_rect; }
+ 
+   void DoState(PointerWrap& p);
+ 
