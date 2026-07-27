@@ -5,6 +5,7 @@ NS_ASSUME_NONNULL_BEGIN
 @interface StarlightPaths : NSObject
 
 @property(nonatomic, readonly) NSURL* root;
+@property(nonatomic, readonly) NSURL* gameRoot;
 @property(nonatomic, readonly) NSURL* game;
 @property(nonatomic, readonly) NSURL* user;
 @property(nonatomic, readonly) NSURL* saves;
@@ -13,6 +14,9 @@ NS_ASSUME_NONNULL_BEGIN
 
 + (instancetype)shared;
 - (BOOL)prepare:(NSError**)error;
+- (nullable NSURL*)selectedGameSource;
+- (BOOL)validateGameSource:(NSURL*)url error:(NSError**)error;
+- (nullable NSURL*)importGameSource:(NSURL*)url error:(NSError**)error;
 
 @end
 

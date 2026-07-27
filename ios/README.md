@@ -7,6 +7,7 @@ AVAudioEngine output, haptics, lifecycle behavior, and Files-visible storage.
 
 The Files app exposes:
 
+- `Starlight/Game/*.iso` or `*.wbfs` — validated USA RMGE01 disc images
 - `Starlight/Game/RMGE01` — extracted game tree containing `sys/main.dol`
 - `Starlight/User/Wii/title/00010000/524d4745/data` — save data
 - `Starlight/User/Load/Textures/RMGE01` — replacement textures
@@ -59,3 +60,8 @@ target must statically link the RMGE01 descriptor and call it through
 The production target is intentionally not enabled yet. The current Dolphin-derived chassis still
 assumes AppKit in several Apple CMake branches, and the static core leases JitArm64 for runtime-loaded
 RSO code. Both must be removed before supplying `STARLIGHT_RUNTIME_LIBRARY`.
+
+The host can import ISO and WBFS files without loading the whole image into memory. It verifies the
+Wii disc header, RMGE01 game ID, available storage, and the completed copy before selecting it.
+Decoding either format during gameplay remains the responsibility of the statically linked
+ModernGekko DiscIO runtime.

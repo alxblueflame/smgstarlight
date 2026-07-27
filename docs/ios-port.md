@@ -101,6 +101,11 @@ mixing layer can route separable sources through AVAudioEnvironmentNode.
 in Files. Extracted data, Wii saves, and texture replacements have stable, named locations. Driver
 and shader caches live in Library/Caches and are excluded from backups.
 
+The native document picker accepts ISO and WBFS. Imports are copied on a worker queue, checked for
+free storage, validated as USA RMGE01 both before and after the copy, and selected persistently.
+Files placed directly in `Starlight/Game` are also discovered. The runtime receives either the
+selected image path or the extracted `RMGE01` directory through the same stable host boundary.
+
 Background suspend pauses the runtime when the app resigns active. No unsupported background
 execution mode is requested. Idle sleep is an option backed by `UIApplication.idleTimerDisabled`
 and is reset through normal lifecycle transitions.

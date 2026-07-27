@@ -7,6 +7,7 @@
 #import "StarlightPlatform.h"
 
 #include <atomic>
+#include <string>
 
 @implementation StarlightRuntimeBridge
 {
@@ -52,17 +53,25 @@
     return YES;
 
   StarlightPaths* paths = StarlightPaths.shared;
-  StarlightRuntimeHost host = {
-      .game_path = paths.game.fileSystemRepresentation,
-      .user_path = paths.user.fileSystemRepresentation,
-      .texture_path = paths.textures.fileSystemRepresentation,
-      .metal_layer = (__bridge void*)layer,
-      .read_input = starlight_platform_read_input,
-      .write_audio = starlight_platform_write_audio,
-      .play_haptic = starlight_platform_play_haptic,
-  };
+  NSURL* gameSource = [paths selectedGameSource];
+  if (!gameSource)
+    return NO;
+
+  std::string gamePath = gameSource.fileSystemRepresentation;
+  std::string userPath = paths.user.fileSystemRepresentation;
+  std::string texturePath = paths.textures.fileSystemRepresentation;
+  CAMetalLayer* retainedLayer = layer;
   _running.store(true, std::memory_order_release);
   dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), ^{
+    StarlightRuntimeHost host = {
+        .game_path = gamePath.c_str(),
+        .user_path = userPath.c_str(),
+        .texture_path = texturePath.c_str(),
+        .metal_layer = (__bridge void*)retainedLayer,
+        .read_input = starlight_platform_read_input,
+        .write_audio = starlight_platform_write_audio,
+        .play_haptic = starlight_platform_play_haptic,
+    };
     starlight_runtime_start(&host);
     self->_running.store(false, std::memory_order_release);
   });

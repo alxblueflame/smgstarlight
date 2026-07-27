@@ -9,7 +9,10 @@
 #import "StarlightSettings.h"
 #import "StarlightSettingsViewController.h"
 
-@interface StarlightViewController : UIViewController <StarlightMetalViewDelegate>
+#import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
+
+@interface StarlightViewController
+    : UIViewController <StarlightMetalViewDelegate, UIDocumentPickerDelegate>
 @end
 
 @implementation StarlightViewController
@@ -17,6 +20,7 @@
   StarlightMetalView* _metalView;
   StarlightTouchOverlay* _touchOverlay;
   UILabel* _status;
+  UIButton* _importButton;
   UIButton* _settingsButton;
   id _settingsObserver;
 }
@@ -49,6 +53,23 @@
                                                       constant:24],
     [_status.trailingAnchor constraintLessThanOrEqualToAnchor:root.safeAreaLayoutGuide.trailingAnchor
                                                     constant:-24],
+  ]];
+
+  _importButton = [UIButton buttonWithType:UIButtonTypeSystem];
+  _importButton.translatesAutoresizingMaskIntoConstraints = NO;
+  [_importButton setTitle:@"Choose ISO or WBFS" forState:UIControlStateNormal];
+  _importButton.titleLabel.font = [UIFont preferredFontForTextStyle:UIFontTextStyleHeadline];
+  _importButton.tintColor = UIColor.whiteColor;
+  _importButton.backgroundColor = [UIColor colorWithWhite:1.0 alpha:0.18];
+  _importButton.contentEdgeInsets = UIEdgeInsetsMake(12, 20, 12, 20);
+  _importButton.layer.cornerRadius = 12.0;
+  [_importButton addTarget:self
+                    action:@selector(chooseGameImage)
+          forControlEvents:UIControlEventTouchUpInside];
+  [root addSubview:_importButton];
+  [NSLayoutConstraint activateConstraints:@[
+    [_importButton.topAnchor constraintEqualToAnchor:_status.bottomAnchor constant:20],
+    [_importButton.centerXAnchor constraintEqualToAnchor:root.safeAreaLayoutGuide.centerXAnchor],
   ]];
 
   _settingsButton = [UIButton buttonWithType:UIButtonTypeSystem];
@@ -107,22 +128,87 @@
 - (void)viewDidAppear:(BOOL)animated
 {
   [super viewDidAppear:animated];
-  NSFileManager* manager = NSFileManager.defaultManager;
-  NSURL* dol = [StarlightPaths.shared.game URLByAppendingPathComponent:@"sys/main.dol"];
-  if (![manager fileExistsAtPath:dol.path])
+  [self refreshGameSource];
+}
+
+- (void)refreshGameSource
+{
+  NSURL* source = [StarlightPaths.shared selectedGameSource];
+  _status.hidden = NO;
+  _importButton.enabled = YES;
+  _importButton.hidden = NO;
+  [_importButton setTitle:source ? @"Change Game Image" : @"Choose ISO or WBFS"
+                 forState:UIControlStateNormal];
+
+  if (!source)
   {
     _status.text =
-        @"Copy the extracted RMGE01 folder into\nFiles → On My iPhone/iPad → "
-         "SMG Starlight → Starlight → Game → RMGE01";
+        @"Choose an RMGE01 ISO or WBFS image, or copy the extracted game to\n"
+         "Starlight/Game/RMGE01";
     return;
   }
   if (![StarlightRuntimeBridge.shared isAvailable])
   {
-    _status.text = @"The iOS host is ready. This build does not contain the private RMGE01 module.";
+    _status.text = [NSString
+        stringWithFormat:@"Selected: %@\nThe iOS host does not contain the ARM64 game runtime yet.",
+                         source.lastPathComponent];
     return;
   }
   if ([StarlightRuntimeBridge.shared startWithLayer:_metalView.metalLayer])
+  {
     _status.hidden = YES;
+    _importButton.hidden = YES;
+  }
+}
+
+- (void)chooseGameImage
+{
+  UTType* iso = [UTType typeWithFilenameExtension:@"iso"];
+  UTType* wbfs = [UTType typeWithFilenameExtension:@"wbfs"];
+  NSMutableArray<UTType*>* types = [NSMutableArray array];
+  if (iso)
+    [types addObject:iso];
+  if (wbfs)
+    [types addObject:wbfs];
+  if (types.count == 0)
+    [types addObject:UTTypeData];
+
+  UIDocumentPickerViewController* picker =
+      [[UIDocumentPickerViewController alloc] initForOpeningContentTypes:types asCopy:YES];
+  picker.delegate = self;
+  picker.allowsMultipleSelection = NO;
+  [self presentViewController:picker animated:YES completion:nil];
+}
+
+- (void)documentPicker:(UIDocumentPickerViewController*)controller
+    didPickDocumentsAtURLs:(NSArray<NSURL*>*)urls
+{
+  (void)controller;
+  NSURL* source = urls.firstObject;
+  if (!source)
+    return;
+
+  _importButton.enabled = NO;
+  _status.hidden = NO;
+  _status.text = @"Validating and importing the game image…";
+  __weak StarlightViewController* weakSelf = self;
+  dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+    NSError* error;
+    NSURL* imported = [StarlightPaths.shared importGameSource:source error:&error];
+    dispatch_async(dispatch_get_main_queue(), ^{
+      StarlightViewController* strongSelf = weakSelf;
+      if (!strongSelf)
+        return;
+      if (!imported)
+      {
+        strongSelf->_importButton.enabled = YES;
+        strongSelf->_status.text =
+            error.localizedDescription ?: @"The game image could not be imported.";
+        return;
+      }
+      [strongSelf refreshGameSource];
+    });
+  });
 }
 
 - (BOOL)prefersHomeIndicatorAutoHidden
