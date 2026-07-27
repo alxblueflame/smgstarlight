@@ -32,7 +32,9 @@
 
   __weak StarlightHaptics* weakSelf = self;
   _engine.resetHandler = ^{
-    [weakSelf->_engine startAndReturnError:nil];
+    StarlightHaptics* strongSelf = weakSelf;
+    if (strongSelf)
+      [strongSelf->_engine startAndReturnError:nil];
   };
   [_engine startAndReturnError:nil];
 }
