@@ -4,10 +4,16 @@ diff --git a/CMakeLists.txt b/CMakeLists.txt
 @@ -715,7 +715,7 @@ if(ENABLE_CUBEB)
    add_definitions(-DHAVE_CUBEB)
  endif()
+ 
+-if(NOT ANDROID)
++if(NOT ANDROID AND NOT CMAKE_SYSTEM_NAME STREQUAL "iOS")
+   dolphin_find_optional_system_library(LibUSB Externals/libusb)
+   add_definitions(-D__LIBUSB__)
+ endif()
 diff --git a/Source/Core/InputCommon/CMakeLists.txt b/Source/Core/InputCommon/CMakeLists.txt
 --- a/Source/Core/InputCommon/CMakeLists.txt
 +++ b/Source/Core/InputCommon/CMakeLists.txt
-@@ -108,7 +108,7 @@ if(WIN32)
+@@ -108,6 +108,6 @@ if(WIN32)
      ControllerInterface/ForceFeedback/ForceFeedbackDevice.h
    )
 -elseif(APPLE)
@@ -15,17 +21,11 @@ diff --git a/Source/Core/InputCommon/CMakeLists.txt b/Source/Core/InputCommon/CM
    target_sources(inputcommon PRIVATE
      ControllerInterface/Quartz/Quartz.h
      ControllerInterface/Quartz/Quartz.mm
-@@ -144,7 +144,7 @@ elseif(ANDROID)
+@@ -144,6 +144,6 @@ elseif(ANDROID)
    )
  endif()
  
 -if(NOT ANDROID)
 +if(NOT ANDROID AND NOT CMAKE_SYSTEM_NAME STREQUAL "iOS")
    target_link_libraries(inputcommon PUBLIC LibUSB::LibUSB)
- endif()
- 
--if(NOT ANDROID)
-+if(NOT ANDROID AND NOT CMAKE_SYSTEM_NAME STREQUAL "iOS")
-   dolphin_find_optional_system_library(LibUSB Externals/libusb)
-   add_definitions(-D__LIBUSB__)
  endif()
