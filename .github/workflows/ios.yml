@@ -104,7 +104,8 @@ jobs:
               done
             exit "$XCODE_STATUS"
           fi
-          APP_PATH=$(find build/ios/DerivedData/Build/Products/Release-iphoneos -maxdepth 1 -name "*.app" -print -quit)
+          set -e
+          APP_PATH=$(find build/ios -type d -path "*Release-iphoneos/*.app" -print -quit)
           test -n "$APP_PATH"
           mkdir -p build/ios/Payload
           ditto "$APP_PATH" "build/ios/Payload/$(basename "$APP_PATH")"
