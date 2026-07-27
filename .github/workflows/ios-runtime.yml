@@ -54,11 +54,13 @@ jobs:
         shell: bash
         run: |
           set -o pipefail
-          cmake -S third_party/ModernGekko -B build/ios-runtime -G Xcode \
+          cmake -S third_party/ModernGekko -B build/ios-runtime -G Ninja \
             -DCMAKE_SYSTEM_NAME=iOS \
             -DCMAKE_SYSTEM_PROCESSOR=arm64 \
             -DCMAKE_OSX_ARCHITECTURES=arm64 \
+            -DCMAKE_OSX_SYSROOT=iphoneos \
             -DCMAKE_OSX_DEPLOYMENT_TARGET=16.0 \
+            -DCMAKE_BUILD_TYPE=Release \
             -DMODERNGEKKO_ENABLE_DYNAMIC_MODULES=OFF \
             -DMODERNGEKKO_ENABLE_DOLPHIN_TESTS=OFF \
             -DBUILD_TESTING=OFF 2>&1 | tee build-ios-runtime-configure.log
@@ -67,14 +69,10 @@ jobs:
         shell: bash
         run: |
           set +e
-          xcodebuild \
-            -project build/ios-runtime/ModernGekko.xcodeproj \
-            -target moderngekko \
-            -configuration Release \
-            -sdk iphoneos \
-            -destination "generic/platform=iOS" \
-            CODE_SIGNING_ALLOWED=NO \
-            build 2>&1 | tee build-ios-runtime.log
+          cmake --build build/ios-runtime \
+            --target moderngekko \
+            --config Release \
+            --parallel 3 2>&1 | tee build-ios-runtime.log
           status=${PIPESTATUS[0]}
           if [ "$status" -ne 0 ]; then
             grep -E "error:|Undefined symbols|ld: |The following build commands failed" \
