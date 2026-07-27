@@ -94,7 +94,7 @@ std::array<TouchButtonSpec, 7> GetTouchButtons(CGRect bounds, UIEdgeInsets safe,
 
   if (@available(iOS 14.0, *))
   {
-    GCKeyboard.keyboard.keyboardInput.keyChangedHandler =
+    GCKeyboard.coalescedKeyboard.keyboardInput.keyChangedHandler =
         ^(GCKeyboardInput*, GCControllerButtonInput*, GCKeyCode code, BOOL pressed) {
           [weakSelf handleKey:code pressed:pressed];
         };
@@ -177,26 +177,26 @@ std::array<TouchButtonSpec, 7> GetTouchButtons(CGRect bounds, UIEdgeInsets safe,
 - (void)handleKey:(GCKeyCode)code pressed:(BOOL)pressed API_AVAILABLE(ios(14.0))
 {
   uint32_t button = 0;
-  switch (code)
-  {
-  case GCKeyCodeSpacebar: button = STARLIGHT_BUTTON_A; break;
-  case GCKeyCodeLeftShift: button = STARLIGHT_BUTTON_B; break;
-  case GCKeyCodeKeyE: button = STARLIGHT_BUTTON_SPIN; break;
-  case GCKeyCodeEscape: button = STARLIGHT_BUTTON_PLUS; break;
-  default: break;
-  }
+  if ([code isEqualToString:GCKeyCodeSpacebar])
+    button = STARLIGHT_BUTTON_A;
+  else if ([code isEqualToString:GCKeyCodeLeftShift])
+    button = STARLIGHT_BUTTON_B;
+  else if ([code isEqualToString:GCKeyCodeKeyE])
+    button = STARLIGHT_BUTTON_SPIN;
+  else if ([code isEqualToString:GCKeyCodeEscape])
+    button = STARLIGHT_BUTTON_PLUS;
   if (button)
     [self setTouchButton:button pressed:pressed];
 
   os_unfair_lock_lock(&_lock);
   const float value = pressed ? 1.0f : 0.0f;
-  if (code == GCKeyCodeKeyW)
+  if ([code isEqualToString:GCKeyCodeKeyW])
     _state.move_y = value;
-  else if (code == GCKeyCodeKeyS)
+  else if ([code isEqualToString:GCKeyCodeKeyS])
     _state.move_y = -value;
-  else if (code == GCKeyCodeKeyA)
+  else if ([code isEqualToString:GCKeyCodeKeyA])
     _state.move_x = -value;
-  else if (code == GCKeyCodeKeyD)
+  else if ([code isEqualToString:GCKeyCodeKeyD])
     _state.move_x = value;
   os_unfair_lock_unlock(&_lock);
 }
