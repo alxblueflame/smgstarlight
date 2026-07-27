@@ -53,6 +53,10 @@ jobs:
             git -C third_party/ModernGekko/vendor/dolphin apply \
               "$GITHUB_WORKSPACE/patches/ios/recompcore-ios-filesystem.patch"
           fi
+          if [ -f patches/ios/recompcore-ios-memory.patch ]; then
+            git -C third_party/ModernGekko/vendor/dolphin apply \
+              "$GITHUB_WORKSPACE/patches/ios/recompcore-ios-memory.patch"
+          fi
 
       - name: Configure iphoneos ARM64 runtime
         shell: bash

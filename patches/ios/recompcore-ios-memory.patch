@@ -1,0 +1,42 @@
+diff --git a/Source/Core/Common/MemoryUtil.cpp b/Source/Core/Common/MemoryUtil.cpp
+--- a/Source/Core/Common/MemoryUtil.cpp
++++ b/Source/Core/Common/MemoryUtil.cpp
+@@ -16,7 +16,10 @@
+ #else
+ #include <stdio.h>
+ #include <sys/mman.h>
+-#if defined(_M_ARM_64) && defined(__APPLE__)
++#if defined(__APPLE__)
++#include <TargetConditionals.h>
++#endif
++#if defined(_M_ARM_64) && defined(__APPLE__) && !TARGET_OS_IPHONE
+ #include <pthread.h>
+ #endif
+ #if defined __APPLE__ || defined __FreeBSD__ || defined __OpenBSD__ || defined __NetBSD__
+@@ -39,7 +42,7 @@ void* AllocateExecutableMemory(size_t size)
+   void* ptr = VirtualAlloc(nullptr, size, MEM_COMMIT, PAGE_EXECUTE_READWRITE);
+ #else
+   int map_flags = MAP_ANON | MAP_PRIVATE;
+-#if defined(__APPLE__)
++#if defined(__APPLE__) && !TARGET_OS_IPHONE
+   map_flags |= MAP_JIT;
+ #endif
+   void* ptr = mmap(nullptr, size, PROT_READ | PROT_WRITE | PROT_EXEC, map_flags, -1, 0);
+@@ -93,7 +96,7 @@ static int& JITPageWriteNestCounter()
+ // Allows a thread to write to executable memory, but not execute the data.
+ void JITPageWriteEnableExecuteDisable()
+ {
+-#if defined(_M_ARM_64) && defined(__APPLE__)
++#if defined(_M_ARM_64) && defined(__APPLE__) && !TARGET_OS_IPHONE
+   if (JITPageWriteNestCounter() == 0)
+   {
+     pthread_jit_write_protect_np(0);
+@@ -112,7 +115,7 @@ void JITPageWriteDisableExecuteEnable()
+   if (JITPageWriteNestCounter() < 0)
+     PanicAlertFmt("JITPageWriteNestCounter() underflowed");
+ 
+-#if defined(_M_ARM_64) && defined(__APPLE__)
++#if defined(_M_ARM_64) && defined(__APPLE__) && !TARGET_OS_IPHONE
+   if (JITPageWriteNestCounter() == 0)
+   {
+     pthread_jit_write_protect_np(1);
