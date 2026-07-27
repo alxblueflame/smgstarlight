@@ -29,6 +29,8 @@ jobs:
         run: |
           set -euo pipefail
           git -C third_party/ModernGekko apply \
+            "$GITHUB_WORKSPACE/patches/ios/moderngekko-prerequisite.patch"
+          git -C third_party/ModernGekko apply \
             "$GITHUB_WORKSPACE/patches/moderngekko/0006-starlight-complete.patch"
           git -C third_party/ModernGekko/vendor/dolphin apply \
             "$GITHUB_WORKSPACE/patches/recompcore/0008-starlight-complete.patch"
