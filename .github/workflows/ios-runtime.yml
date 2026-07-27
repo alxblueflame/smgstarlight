@@ -1,0 +1,92 @@
+name: iOS Runtime
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/ios-runtime.yml"
+      - "ios/runtime/**"
+      - "patches/ios/**"
+      - "patches/moderngekko/**"
+      - "patches/recompcore/**"
+      - "patches/dolrecomp/**"
+
+permissions:
+  contents: read
+
+jobs:
+  runtime:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: recursive
+
+      - name: Apply Starlight runtime patches
+        shell: bash
+        run: |
+          set -euo pipefail
+          git -C third_party/ModernGekko apply \
+            "$GITHUB_WORKSPACE/patches/moderngekko/0006-starlight-complete.patch"
+          git -C third_party/ModernGekko/vendor/dolphin apply \
+            "$GITHUB_WORKSPACE/patches/recompcore/0008-starlight-complete.patch"
+          git -C third_party/ModernGekko/vendor/dolphin/DolRecomp switch --detach \
+            efaa0a7dd0fdbedc3445d155b5ba5b228d801def
+          git -C third_party/ModernGekko/vendor/dolphin/DolRecomp apply \
+            "$GITHUB_WORKSPACE/patches/dolrecomp/0005-starlight-complete.patch"
+          if [ -f patches/ios/moderngekko-ios.patch ]; then
+            git -C third_party/ModernGekko apply \
+              "$GITHUB_WORKSPACE/patches/ios/moderngekko-ios.patch"
+          fi
+          if [ -f patches/ios/recompcore-ios.patch ]; then
+            git -C third_party/ModernGekko/vendor/dolphin apply \
+              "$GITHUB_WORKSPACE/patches/ios/recompcore-ios.patch"
+          fi
+
+      - name: Configure iphoneos ARM64 runtime
+        shell: bash
+        run: |
+          set -o pipefail
+          cmake -S third_party/ModernGekko -B build/ios-runtime -G Xcode \
+            -DCMAKE_SYSTEM_NAME=iOS \
+            -DCMAKE_OSX_ARCHITECTURES=arm64 \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=16.0 \
+            -DMODERNGEKKO_ENABLE_DYNAMIC_MODULES=OFF \
+            -DMODERNGEKKO_ENABLE_DOLPHIN_TESTS=OFF \
+            -DBUILD_TESTING=OFF 2>&1 | tee build-ios-runtime-configure.log
+
+      - name: Build static runtime
+        shell: bash
+        run: |
+          set +e
+          xcodebuild \
+            -project build/ios-runtime/ModernGekko.xcodeproj \
+            -target moderngekko \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination "generic/platform=iOS" \
+            CODE_SIGNING_ALLOWED=NO \
+            build 2>&1 | tee build-ios-runtime.log
+          status=${PIPESTATUS[0]}
+          if [ "$status" -ne 0 ]; then
+            grep -E "error:|Undefined symbols|ld: |The following build commands failed" \
+              build-ios-runtime.log | tail -50 |
+              while IFS= read -r line; do
+                line=${line//'%'/'%25'}
+                line=${line//$'\r'/'%0D'}
+                line=${line//$'\n'/'%0A'}
+                echo "::error title=iOS runtime build failed::$line"
+              done
+          fi
+          exit "$status"
+
+      - name: Upload runtime libraries
+        uses: actions/upload-artifact@v4
+        with:
+          name: Starlight-iOS-runtime-arm64
+          path: |
+            build/ios-runtime/**/*.a
+            build/ios-runtime/**/*.dSYM/**
+          if-no-files-found: error
