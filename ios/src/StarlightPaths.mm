@@ -158,12 +158,13 @@ BOOL ReadBytes(NSFileHandle* handle, uint64_t offset, NSUInteger length, NSData*
     }
     else if (std::memcmp(bytes, "WBFS", 4) == 0)
     {
-      const uint8_t shift = bytes[9];
-      const uint8_t discSlot = bytes[12];
-      if (shift >= 15 && shift <= 31 && discSlot != 0)
+      const uint8_t hdSectorShift = bytes[8];
+      const uint8_t wbfsSectorShift = bytes[9];
+      if (hdSectorShift >= 9 && hdSectorShift <= 31 && wbfsSectorShift >= 15 &&
+          wbfsSectorShift <= 31 && bytes[12] != 0)
       {
         NSData* discHeader;
-        const uint64_t offset = static_cast<uint64_t>(discSlot) << shift;
+        const uint64_t offset = 1ULL << hdSectorShift;
         if (ReadBytes(handle, offset, 6, &discHeader, &openError))
           valid = IsRMGE01(static_cast<const uint8_t*>(discHeader.bytes));
       }
