@@ -1,0 +1,18 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -68,8 +68,12 @@ if(MODERNGEKKO_ENABLE_DOLPHIN_RUNTIME)
+     set(USE_UPNP OFF CACHE BOOL "" FORCE)
+     set(ENCODE_FRAMEDUMPS OFF CACHE BOOL "" FORCE)
+     set(ENABLE_LLVM OFF CACHE BOOL "" FORCE)
+-    # Cubeb is Dolphin's only audio backend on macOS
+-    set(ENABLE_CUBEB ON CACHE BOOL "" FORCE)
++    if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
++        # Audio is supplied by the UIKit host through AVAudioEngine.
++        set(ENABLE_CUBEB OFF CACHE BOOL "" FORCE)
++    else()
++        set(ENABLE_CUBEB ON CACHE BOOL "" FORCE)
++    endif()
+     set(ENABLE_HWDB OFF CACHE BOOL "" FORCE)
+     set(ENABLE_EVDEV OFF CACHE BOOL "" FORCE)
+     set(ENABLE_WAYLAND ON CACHE BOOL "" FORCE)
