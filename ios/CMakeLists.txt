@@ -42,6 +42,7 @@ target_compile_options(StarlightIOS PRIVATE
   $<$<COMPILE_LANGUAGE:C,CXX,OBJC,OBJCXX>:-Wextra>
   $<$<COMPILE_LANGUAGE:C,CXX,OBJC,OBJCXX>:-Werror=return-type>
   $<$<COMPILE_LANGUAGE:C,CXX,OBJC,OBJCXX>:-ffp-contract=off>
+  $<$<COMPILE_LANGUAGE:OBJC,OBJCXX>:-fobjc-arc>
 )
 target_compile_definitions(StarlightIOS PRIVATE
   STARLIGHT_BUNDLE_ID="${STARLIGHT_BUNDLE_ID}"
