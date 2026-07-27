@@ -1,0 +1,42 @@
+diff --git a/Source/Core/Common/FilesystemWatcher.cpp b/Source/Core/Common/FilesystemWatcher.cpp
+--- a/Source/Core/Common/FilesystemWatcher.cpp
++++ b/Source/Core/Common/FilesystemWatcher.cpp
+@@ -3,6 +3,32 @@
+ 
+ #include "Common/FilesystemWatcher.h"
+ 
++#if defined(__APPLE__)
++#include <TargetConditionals.h>
++#endif
++
++#if TARGET_OS_IOS
++
++namespace wtr
++{
++inline namespace watcher
++{
++class watch
++{
++};
++}
++}
++
++namespace Common
++{
++FilesystemWatcher::FilesystemWatcher() = default;
++FilesystemWatcher::~FilesystemWatcher() = default;
++void FilesystemWatcher::Watch(const std::string&) {}
++void FilesystemWatcher::Unwatch(const std::string&) {}
++}
++
++#else
++
+ #include <wtr/watcher.hpp>
+ 
+ #include "Common/Logging/Log.h"
+@@ -65,3 +91,5 @@ void FilesystemWatcher::Unwatch(const std::string& path)
+   m_watched_paths.erase(path);
+ }
+ }  // namespace Common
++
++#endif
