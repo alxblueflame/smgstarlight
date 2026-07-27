@@ -56,6 +56,7 @@ jobs:
           set -o pipefail
           cmake -S third_party/ModernGekko -B build/ios-runtime -G Xcode \
             -DCMAKE_SYSTEM_NAME=iOS \
+            -DCMAKE_SYSTEM_PROCESSOR=arm64 \
             -DCMAKE_OSX_ARCHITECTURES=arm64 \
             -DCMAKE_OSX_DEPLOYMENT_TARGET=16.0 \
             -DMODERNGEKKO_ENABLE_DYNAMIC_MODULES=OFF \
