@@ -1,0 +1,105 @@
+cmake_minimum_required(VERSION 3.25)
+
+if(NOT CMAKE_SYSTEM_NAME STREQUAL "iOS")
+  message(FATAL_ERROR "Configure with -DCMAKE_SYSTEM_NAME=iOS")
+endif()
+
+project(StarlightIOS VERSION 0.1.0 LANGUAGES C CXX OBJC OBJCXX)
+
+set(CMAKE_C_STANDARD 11)
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_OBJCXX_STANDARD 20)
+set(CMAKE_OBJCXX_STANDARD_REQUIRED ON)
+set(CMAKE_XCODE_ATTRIBUTE_ONLY_ACTIVE_ARCH NO)
+set(CMAKE_XCODE_ATTRIBUTE_TARGETED_DEVICE_FAMILY "1,2")
+
+set(STARLIGHT_BUNDLE_ID "org.starlight.smg" CACHE STRING "iOS bundle identifier")
+set(STARLIGHT_TEAM_ID "" CACHE STRING "Apple Developer team identifier")
+set(STARLIGHT_PROFILE_NAME "" CACHE STRING "Provisioning profile name")
+set(STARLIGHT_RUNTIME_LIBRARY "" CACHE FILEPATH "Optional private ARM64 runtime archive")
+
+set(STARLIGHT_SOURCES
+  src/main.mm
+  src/StarlightAppDelegate.mm
+  src/StarlightAudio.mm
+  src/StarlightDynamicResolution.cpp
+  src/StarlightHaptics.mm
+  src/StarlightInput.mm
+  src/StarlightMetalFX.mm
+  src/StarlightMetalView.mm
+  src/StarlightPaths.mm
+  src/StarlightRuntimeBridge.mm
+  src/StarlightSettings.mm
+  src/StarlightSettingsViewController.mm
+)
+
+add_executable(StarlightIOS MACOSX_BUNDLE ${STARLIGHT_SOURCES})
+
+target_include_directories(StarlightIOS PRIVATE include src)
+target_compile_options(StarlightIOS PRIVATE
+  $<$<COMPILE_LANGUAGE:C,CXX,OBJC,OBJCXX>:-Wall>
+  $<$<COMPILE_LANGUAGE:C,CXX,OBJC,OBJCXX>:-Wextra>
+  $<$<COMPILE_LANGUAGE:C,CXX,OBJC,OBJCXX>:-Werror=return-type>
+  $<$<COMPILE_LANGUAGE:C,CXX,OBJC,OBJCXX>:-ffp-contract=off>
+)
+target_compile_definitions(StarlightIOS PRIVATE
+  STARLIGHT_BUNDLE_ID="${STARLIGHT_BUNDLE_ID}"
+  $<$<BOOL:${STARLIGHT_RUNTIME_LIBRARY}>:STARLIGHT_LINK_RUNTIME=1>
+)
+
+find_library(UIKIT_FRAMEWORK UIKit REQUIRED)
+find_library(FOUNDATION_FRAMEWORK Foundation REQUIRED)
+find_library(METAL_FRAMEWORK Metal REQUIRED)
+find_library(METALFX_FRAMEWORK MetalFX REQUIRED)
+find_library(QUARTZCORE_FRAMEWORK QuartzCore REQUIRED)
+find_library(AVFOUNDATION_FRAMEWORK AVFoundation REQUIRED)
+find_library(AUDIOTOOLBOX_FRAMEWORK AudioToolbox REQUIRED)
+find_library(GAMECONTROLLER_FRAMEWORK GameController REQUIRED)
+find_library(COREMOTION_FRAMEWORK CoreMotion REQUIRED)
+find_library(COREHAPTICS_FRAMEWORK CoreHaptics REQUIRED)
+
+target_link_libraries(StarlightIOS PRIVATE
+  ${UIKIT_FRAMEWORK}
+  ${FOUNDATION_FRAMEWORK}
+  ${METAL_FRAMEWORK}
+  ${METALFX_FRAMEWORK}
+  ${QUARTZCORE_FRAMEWORK}
+  ${AVFOUNDATION_FRAMEWORK}
+  ${AUDIOTOOLBOX_FRAMEWORK}
+  ${GAMECONTROLLER_FRAMEWORK}
+  ${COREMOTION_FRAMEWORK}
+  ${COREHAPTICS_FRAMEWORK}
+)
+
+if(STARLIGHT_RUNTIME_LIBRARY)
+  if(NOT EXISTS "${STARLIGHT_RUNTIME_LIBRARY}")
+    message(FATAL_ERROR "STARLIGHT_RUNTIME_LIBRARY does not exist")
+  endif()
+  add_library(starlight_private_runtime STATIC IMPORTED GLOBAL)
+  set_target_properties(starlight_private_runtime PROPERTIES
+    IMPORTED_LOCATION "${STARLIGHT_RUNTIME_LIBRARY}")
+  target_link_libraries(StarlightIOS PRIVATE starlight_private_runtime)
+endif()
+
+set_target_properties(StarlightIOS PROPERTIES
+  OUTPUT_NAME "Super Mario Galaxy Starlight"
+  MACOSX_BUNDLE_GUI_IDENTIFIER "${STARLIGHT_BUNDLE_ID}"
+  MACOSX_BUNDLE_BUNDLE_NAME "Super Mario Galaxy: Starlight"
+  MACOSX_BUNDLE_SHORT_VERSION_STRING "${PROJECT_VERSION}"
+  MACOSX_BUNDLE_BUNDLE_VERSION "1"
+  MACOSX_BUNDLE_INFO_PLIST "${CMAKE_CURRENT_SOURCE_DIR}/Info.plist.in"
+  XCODE_ATTRIBUTE_PRODUCT_BUNDLE_IDENTIFIER "${STARLIGHT_BUNDLE_ID}"
+  XCODE_ATTRIBUTE_CODE_SIGN_ENTITLEMENTS "${CMAKE_CURRENT_SOURCE_DIR}/Starlight.entitlements"
+  XCODE_ATTRIBUTE_DEVELOPMENT_TEAM "${STARLIGHT_TEAM_ID}"
+  XCODE_ATTRIBUTE_IPHONEOS_DEPLOYMENT_TARGET "16.0"
+  XCODE_ATTRIBUTE_ENABLE_BITCODE "NO"
+  XCODE_ATTRIBUTE_GCC_GENERATE_DEBUGGING_SYMBOLS "YES"
+  XCODE_ATTRIBUTE_DEBUG_INFORMATION_FORMAT "dwarf-with-dsym"
+)
+
+configure_file(
+  "${CMAKE_CURRENT_SOURCE_DIR}/ExportOptions.plist.in"
+  "${CMAKE_CURRENT_BINARY_DIR}/ExportOptions.plist"
+  @ONLY
+)

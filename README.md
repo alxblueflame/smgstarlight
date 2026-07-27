@@ -2,7 +2,7 @@
 
 # Super Mario Galaxy: Starlight
 
-Starlight is a native Windows recompilation project for the USA release of Super Mario Galaxy
+Starlight is a native recompilation project for the USA release of Super Mario Galaxy
 (`RMGE01`). DolRecomp translates the game DOL into native code, while ModernGekko provides the Wii
 runtime, graphics, audio, input, filesystem, and timing services.
 
@@ -71,4 +71,5 @@ The numbered older patches are retained as development history where useful.
 pass per upstream repository.
 
 See [architecture.md](docs/architecture.md), [bringup.md](docs/bringup.md),
-[research.md](docs/research.md), and [roadmap.md](docs/roadmap.md).
+[research.md](docs/research.md), [roadmap.md](docs/roadmap.md), and
+[ios-port.md](docs/ios-port.md).

@@ -7,6 +7,10 @@
 /local.ps1
 /dist/
 /packaging/
+/ios/private/
+*.ipa
+*.xcarchive
+DerivedData/
 *.iso
 *.wbfs
 *.rvz

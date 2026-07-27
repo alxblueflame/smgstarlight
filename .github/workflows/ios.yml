@@ -1,0 +1,137 @@
+name: iOS
+
+on:
+  workflow_dispatch:
+    inputs:
+      signed:
+        description: Export a development-signed IPA
+        required: true
+        type: boolean
+        default: false
+  push:
+    branches:
+      - main
+    tags:
+      - "ios-*"
+      - "v*"
+    paths:
+      - ".github/workflows/ios.yml"
+      - "ios/**"
+  pull_request:
+    paths:
+      - ".github/workflows/ios.yml"
+      - "ios/**"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-15
+    env:
+      BUNDLE_ID: ${{ vars.IOS_BUNDLE_ID || 'org.starlight.smg' }}
+      TEAM_ID: ${{ secrets.IOS_TEAM_ID }}
+      PROFILE_NAME: ${{ secrets.IOS_PROVISIONING_PROFILE_NAME }}
+      CERTIFICATE_BASE64: ${{ secrets.IOS_BUILD_CERTIFICATE_BASE64 }}
+      CERTIFICATE_PASSWORD: ${{ secrets.IOS_BUILD_CERTIFICATE_PASSWORD }}
+      PROFILE_BASE64: ${{ secrets.IOS_PROVISIONING_PROFILE_BASE64 }}
+      KEYCHAIN_PASSWORD: ${{ secrets.IOS_KEYCHAIN_PASSWORD }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show toolchain
+        run: |
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+          cmake --version
+
+      - name: Install signing identity
+        if: ${{ inputs.signed == true }}
+        run: |
+          test -n "$CERTIFICATE_BASE64"
+          test -n "$PROFILE_BASE64"
+          test -n "$TEAM_ID"
+          test -n "$PROFILE_NAME"
+          CERTIFICATE_PATH="$RUNNER_TEMP/certificate.p12"
+          PROFILE_PATH="$RUNNER_TEMP/profile.mobileprovision"
+          KEYCHAIN_PATH="$RUNNER_TEMP/starlight-signing.keychain-db"
+          printf '%s' "$CERTIFICATE_BASE64" | base64 --decode > "$CERTIFICATE_PATH"
+          printf '%s' "$PROFILE_BASE64" | base64 --decode > "$PROFILE_PATH"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security import "$CERTIFICATE_PATH" -P "$CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
+          security list-keychain -d user -s "$KEYCHAIN_PATH"
+          security set-key-partition-list -S apple-tool:,apple: -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          mkdir -p "$HOME/Library/MobileDevice/Provisioning Profiles"
+          PROFILE_PLIST="$RUNNER_TEMP/profile.plist"
+          security cms -D -i "$PROFILE_PATH" > "$PROFILE_PLIST"
+          PROFILE_UUID=$(/usr/libexec/PlistBuddy -c "Print:UUID" "$PROFILE_PLIST")
+          cp "$PROFILE_PATH" "$HOME/Library/MobileDevice/Provisioning Profiles/$PROFILE_UUID.mobileprovision"
+
+      - name: Configure iOS project
+        run: |
+          cmake -S ios -B build/ios -G Xcode \
+            -DCMAKE_SYSTEM_NAME=iOS \
+            -DCMAKE_OSX_ARCHITECTURES=arm64 \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=16.0 \
+            -DSTARLIGHT_BUNDLE_ID="$BUNDLE_ID" \
+            -DSTARLIGHT_TEAM_ID="$TEAM_ID" \
+            -DSTARLIGHT_PROFILE_NAME="$PROFILE_NAME"
+
+      - name: Build unsigned device app
+        if: ${{ inputs.signed != true }}
+        run: |
+          xcodebuild \
+            -project build/ios/StarlightIOS.xcodeproj \
+            -scheme StarlightIOS \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination "generic/platform=iOS" \
+            -derivedDataPath build/ios/DerivedData \
+            CODE_SIGNING_ALLOWED=NO \
+            build
+          APP_PATH=$(find build/ios/DerivedData/Build/Products/Release-iphoneos -maxdepth 1 -name "*.app" -print -quit)
+          test -n "$APP_PATH"
+          mkdir -p build/ios/Payload
+          ditto "$APP_PATH" "build/ios/Payload/$(basename "$APP_PATH")"
+          ditto -c -k --keepParent build/ios/Payload build/ios/Starlight-iOS-unsigned.ipa
+
+      - name: Archive and export signed IPA
+        if: ${{ inputs.signed == true }}
+        run: |
+          xcodebuild \
+            -project build/ios/StarlightIOS.xcodeproj \
+            -scheme StarlightIOS \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination "generic/platform=iOS" \
+            -archivePath build/ios/Starlight.xcarchive \
+            DEVELOPMENT_TEAM="$TEAM_ID" \
+            CODE_SIGN_STYLE=Manual \
+            PROVISIONING_PROFILE_SPECIFIER="$PROFILE_NAME" \
+            archive
+          xcodebuild \
+            -exportArchive \
+            -archivePath build/ios/Starlight.xcarchive \
+            -exportPath build/ios/export \
+            -exportOptionsPlist build/ios/ExportOptions.plist
+          IPA_PATH=$(find build/ios/export -maxdepth 1 -name "*.ipa" -print -quit)
+          test -n "$IPA_PATH"
+          cp "$IPA_PATH" build/ios/Starlight-iOS-signed.ipa
+
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Starlight-iOS-${{ inputs.signed == true && 'signed' || 'unsigned' }}
+          path: build/ios/*.ipa
+          if-no-files-found: error
+
+      - name: Publish tagged IPA
+        if: ${{ startsWith(github.ref, 'refs/tags/') && inputs.signed == true }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 || \
+            gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --generate-notes
+          gh release upload "$GITHUB_REF_NAME" build/ios/*.ipa --clobber
