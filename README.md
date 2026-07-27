@@ -1,3 +1,5 @@
+<img width="5120" height="2160" alt="banner" src="https://github.com/user-attachments/assets/30e1a40d-477d-417f-b75d-dfde4422cda6" />
+
 # Super Mario Galaxy: Starlight
 
 Starlight is a native Windows recompilation project for the USA release of Super Mario Galaxy
