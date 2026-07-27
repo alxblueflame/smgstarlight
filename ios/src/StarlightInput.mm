@@ -177,26 +177,26 @@ std::array<TouchButtonSpec, 7> GetTouchButtons(CGRect bounds, UIEdgeInsets safe,
 - (void)handleKey:(GCKeyCode)code pressed:(BOOL)pressed API_AVAILABLE(ios(14.0))
 {
   uint32_t button = 0;
-  if ([code isEqualToString:GCKeyCodeSpacebar])
+  if (code == GCKeyCodeSpacebar)
     button = STARLIGHT_BUTTON_A;
-  else if ([code isEqualToString:GCKeyCodeLeftShift])
+  else if (code == GCKeyCodeLeftShift)
     button = STARLIGHT_BUTTON_B;
-  else if ([code isEqualToString:GCKeyCodeKeyE])
+  else if (code == GCKeyCodeKeyE)
     button = STARLIGHT_BUTTON_SPIN;
-  else if ([code isEqualToString:GCKeyCodeEscape])
+  else if (code == GCKeyCodeEscape)
     button = STARLIGHT_BUTTON_PLUS;
   if (button)
     [self setTouchButton:button pressed:pressed];
 
   os_unfair_lock_lock(&_lock);
   const float value = pressed ? 1.0f : 0.0f;
-  if ([code isEqualToString:GCKeyCodeKeyW])
+  if (code == GCKeyCodeKeyW)
     _state.move_y = value;
-  else if ([code isEqualToString:GCKeyCodeKeyS])
+  else if (code == GCKeyCodeKeyS)
     _state.move_y = -value;
-  else if ([code isEqualToString:GCKeyCodeKeyA])
+  else if (code == GCKeyCodeKeyA)
     _state.move_x = -value;
-  else if ([code isEqualToString:GCKeyCodeKeyD])
+  else if (code == GCKeyCodeKeyD)
     _state.move_x = value;
   os_unfair_lock_unlock(&_lock);
 }
