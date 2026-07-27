@@ -37,7 +37,7 @@ jobs:
       PROFILE_BASE64: ${{ secrets.IOS_PROVISIONING_PROFILE_BASE64 }}
       KEYCHAIN_PASSWORD: ${{ secrets.IOS_KEYCHAIN_PASSWORD }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Show toolchain
         run: |
@@ -82,6 +82,7 @@ jobs:
       - name: Build unsigned device app
         if: ${{ inputs.signed != true }}
         run: |
+          set +e
           xcodebuild \
             -project build/ios/StarlightIOS.xcodeproj \
             -scheme StarlightIOS \
@@ -90,7 +91,19 @@ jobs:
             -destination "generic/platform=iOS" \
             -derivedDataPath build/ios/DerivedData \
             CODE_SIGNING_ALLOWED=NO \
-            build
+            build 2>&1 | tee build/ios/xcodebuild.log
+          XCODE_STATUS=${PIPESTATUS[0]}
+          if [ "$XCODE_STATUS" -ne 0 ]; then
+            grep -E "error:|The following build commands failed" build/ios/xcodebuild.log |
+              tail -30 |
+              while IFS= read -r line; do
+                line=${line//'%'/'%25'}
+                line=${line//$'\r'/'%0D'}
+                line=${line//$'\n'/'%0A'}
+                echo "::error title=Xcode build failed::$line"
+              done
+            exit "$XCODE_STATUS"
+          fi
           APP_PATH=$(find build/ios/DerivedData/Build/Products/Release-iphoneos -maxdepth 1 -name "*.app" -print -quit)
           test -n "$APP_PATH"
           mkdir -p build/ios/Payload
