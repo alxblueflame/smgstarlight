@@ -34,8 +34,9 @@ jobs:
             "$GITHUB_WORKSPACE/patches/moderngekko/0006-starlight-complete.patch"
           git -C third_party/ModernGekko/vendor/dolphin apply \
             "$GITHUB_WORKSPACE/patches/recompcore/0008-starlight-complete.patch"
-          git -C third_party/ModernGekko/vendor/dolphin/DolRecomp switch --detach \
+          git -C third_party/ModernGekko/vendor/dolphin/DolRecomp fetch --depth=1 origin \
             efaa0a7dd0fdbedc3445d155b5ba5b228d801def
+          git -C third_party/ModernGekko/vendor/dolphin/DolRecomp switch --detach FETCH_HEAD
           git -C third_party/ModernGekko/vendor/dolphin/DolRecomp apply \
             "$GITHUB_WORKSPACE/patches/dolrecomp/0005-starlight-complete.patch"
           if [ -f patches/ios/moderngekko-ios.patch ]; then
